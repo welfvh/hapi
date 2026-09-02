@@ -13,6 +13,7 @@ import { SessionStore } from './sessionStore'
 import { UserStore } from './userStore'
 import { UsageStore } from './usageStore'
 import { WorkGraphStore } from './workGraphStore'
+import { GitHubIssueStore } from './githubIssueStore'
 
 export type {
     NativeDevicePlatform,
@@ -36,13 +37,15 @@ export { SessionStore } from './sessionStore'
 export { UserStore } from './userStore'
 export { UsageStore } from './usageStore'
 export { WorkGraphStore } from './workGraphStore'
+export { GitHubIssueRequestConflict, GitHubIssueStore } from './githubIssueStore'
+export type { GitHubIssueRequestInput, StoredGitHubIssueRequest } from './githubIssueStore'
 export {
     WorkGraphNotFoundError,
     WorkGraphPrincipalError,
     WorkGraphValidationError
 } from './workGraph'
 
-const SCHEMA_VERSION: number = 25
+const SCHEMA_VERSION: number = 26
 const REQUIRED_TABLES = [
     'sessions',
     'machines',
@@ -55,7 +58,8 @@ const REQUIRED_TABLES = [
     'usage_events',
     'usage_scan_state',
     'events',
-    'event_links'
+    'event_links',
+    'github_issue_requests'
 ] as const
 
 export class Store {
@@ -72,6 +76,7 @@ export class Store {
     readonly scratchlist: ScratchlistStore
     readonly usage: UsageStore
     readonly workGraph: WorkGraphStore
+    readonly githubIssues: GitHubIssueStore
 
     /**
      * Filesystem path of the underlying SQLite database, or ':memory:' for
@@ -126,6 +131,7 @@ export class Store {
         this.scratchlist = new ScratchlistStore(this.db)
         this.usage = new UsageStore(this.db)
         this.workGraph = new WorkGraphStore(this.db)
+        this.githubIssues = new GitHubIssueStore(this.db)
     }
 
     /**
@@ -347,6 +353,7 @@ export class Store {
             22: () => this.migrateFromV22ToV23(),
             23: () => this.migrateFromV23ToV24(),
             24: () => this.migrateFromV24ToV25(),
+            25: () => this.migrateFromV25ToV26(),
         })
 
         if (currentVersion === 0) {
@@ -591,6 +598,22 @@ export class Store {
                 ON event_links(namespace, from_event_id);
             CREATE INDEX IF NOT EXISTS idx_event_links_namespace_to
                 ON event_links(namespace, to_event_id);
+
+            CREATE TABLE IF NOT EXISTS github_issue_requests (
+                namespace TEXT NOT NULL,
+                local_id TEXT NOT NULL,
+                repository TEXT NOT NULL,
+                payload_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'created')),
+                issue_number INTEGER,
+                issue_url TEXT,
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (namespace, local_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_github_issue_requests_status
+                ON github_issue_requests(namespace, status, updated_at);
         `)
     }
 
@@ -975,6 +998,27 @@ export class Store {
         if (messageColumns.size > 0 && !messageColumns.has('delivery_state')) {
             this.db.exec("ALTER TABLE messages ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'queued'")
         }
+    }
+
+    /** v25→v26: durable, namespace-scoped idempotency for Radiant issue capture. */
+    private migrateFromV25ToV26(): void {
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS github_issue_requests (
+                namespace TEXT NOT NULL,
+                local_id TEXT NOT NULL,
+                repository TEXT NOT NULL,
+                payload_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'created')),
+                issue_number INTEGER,
+                issue_url TEXT,
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (namespace, local_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_github_issue_requests_status
+                ON github_issue_requests(namespace, status, updated_at);
+        `)
     }
 
     /**
