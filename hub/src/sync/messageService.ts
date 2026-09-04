@@ -141,6 +141,11 @@ export class MessageService {
         }
     }
 
+    private hasSingleCliSocket(sessionId: string): boolean {
+        const room = this.io.of('/cli').adapter?.rooms?.get(`session:${sessionId}`)
+        return room?.size === 1
+    }
+
     private recordConsumedAcknowledgement(
         sessionId: string,
         localId: string,
@@ -852,7 +857,8 @@ export class MessageService {
         const isFutureScheduled = msg.scheduledAt !== null && msg.scheduledAt > Date.now()
         const deliveryGated = this.store.isOpenCodeClearDeliveryGated(actualSessionId)
         if (shouldEmitToCli && !isFutureScheduled && !deliveryGated && msg.localId) {
-            shouldEmitToCli = this.store.messages.claimMessagesForDispatch(actualSessionId, [msg.localId]) === 1
+            shouldEmitToCli = this.hasSingleCliSocket(actualSessionId)
+                && this.store.messages.claimMessagesForDispatch(actualSessionId, [msg.localId]) === 1
         }
         if (shouldEmitToCli && !isFutureScheduled && !deliveryGated) {
             const update = {
@@ -925,8 +931,9 @@ export class MessageService {
 
     /** Replay durable immediate prompts whenever their CLI session attaches. */
     replayImmediateQueuedMessages(sessionId: string): number {
-        if (this.store.isOpenCodeClearDeliveryGated(sessionId)) return 0
+        if (this.store.isOpenCodeClearDeliveryGated(sessionId) || !this.hasSingleCliSocket(sessionId)) return 0
         const queued = this.store.messages.getImmediateQueuedLocalMessages(sessionId)
+        let emitted = 0
         for (const msg of queued) {
             if (!msg.localId || this.store.messages.claimMessagesForDispatch(sessionId, [msg.localId]) !== 1) continue
             const update = {
@@ -946,15 +953,17 @@ export class MessageService {
                 }
             }
             this.io.of('/cli').to(`session:${sessionId}`).emit('update', update)
+            emitted++
         }
-        return queued.length
+        return emitted
     }
 
     /** Release a completed clear handoff in finalized seq order. */
     releaseDeliverableQueuedMessages(sessionId: string, now: number = Date.now()): number {
-        if (this.store.isOpenCodeClearDeliveryGated(sessionId)) return 0
+        if (this.store.isOpenCodeClearDeliveryGated(sessionId) || !this.hasSingleCliSocket(sessionId)) return 0
         const queued = this.store.messages.getUninvokedLocalMessages(sessionId, { deliverableOnly: true })
             .filter((msg) => msg.scheduledAt === null || msg.scheduledAt <= now)
+        let emitted = 0
         for (const msg of queued) {
             if (!msg.localId || this.store.messages.claimMessagesForDispatch(sessionId, [msg.localId]) !== 1) continue
             const update = {
@@ -974,8 +983,9 @@ export class MessageService {
                 }
             }
             this.io.of('/cli').to(`session:${sessionId}`).emit('update', update)
+            emitted++
         }
-        return queued.length
+        return emitted
     }
 
     /** Called by the hub 5-second tick (syncEngine.expireInactive).
@@ -1005,7 +1015,7 @@ export class MessageService {
             }
             const cliNamespace = this.io.of('/cli')
             const roomName = `session:${msg.sessionId}`
-            if ((cliNamespace.adapter.rooms.get(roomName)?.size ?? 0) !== 1) continue
+            if (!this.hasSingleCliSocket(msg.sessionId)) continue
             const localId = msg.localId
             if (typeof localId !== 'string'
                 || this.store.messages.claimMessagesForDispatch(msg.sessionId, [localId]) !== 1) {

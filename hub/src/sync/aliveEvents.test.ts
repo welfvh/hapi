@@ -21,6 +21,7 @@ describe('alive incremental events', () => {
         const emitted: Array<{ body?: { t?: string; message?: { localId?: string | null } } }> = []
         const io = {
             of: () => ({
+                adapter: { rooms: { get: () => new Set(['cli-1']) } },
                 to: () => ({ emit: (_event: string, payload: unknown) => emitted.push(payload as typeof emitted[number]) })
             })
         }
@@ -149,6 +150,7 @@ describe('alive incremental events', () => {
         const emittedSocketUpdates: unknown[] = []
         const io = {
             of: () => ({
+                adapter: { rooms: { get: () => new Set(['cli-1']) } },
                 to: () => ({
                     emit: (_event: string, payload: unknown) => {
                         emittedSocketUpdates.push(payload)
@@ -251,6 +253,7 @@ describe('alive incremental events', () => {
         const store = new Store(':memory:')
         const io = {
             of: () => ({
+                adapter: { rooms: { get: () => new Set(['cli-1']) } },
                 to: () => ({ emit() {} })
             })
         }
@@ -296,6 +299,7 @@ describe('alive incremental events', () => {
         const store = new Store(':memory:')
         const io = {
             of: () => ({
+                adapter: { rooms: { get: () => new Set(['cli-1']) } },
                 to: () => ({ emit() {} })
             })
         }

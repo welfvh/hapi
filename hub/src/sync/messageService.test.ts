@@ -987,7 +987,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => undefined } }
+                adapter: { rooms: { get: () => new Set(['cli-1']) } }
             })
         } as unknown as Server
 
@@ -1027,7 +1027,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => undefined } }
+                adapter: { rooms: { get: () => new Set(['cli-1']) } }
             })
         } as unknown as Server
 
@@ -1056,7 +1056,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => undefined } }
+                adapter: { rooms: { get: () => new Set(['cli-1']) } }
             })
         } as unknown as Server
 
@@ -1089,7 +1089,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => undefined } }
+                adapter: { rooms: { get: () => new Set(['cli-1']) } }
             })
         } as unknown as Server
 
@@ -1160,8 +1160,9 @@ describe('MessageService.sendMessage with scheduledAt', () => {
 })
 
 describe('MessageService.sendMessage deliveryMode', () => {
-    function makeTrackingIo(): { io: Server; cliEmitted: unknown[] } {
+    function makeTrackingIo(socketCount = 1): { io: Server; cliEmitted: unknown[] } {
         const cliEmitted: unknown[] = []
+        const sockets = new Set(Array.from({ length: socketCount }, (_, index) => `cli-${index}`))
         const io = {
             of: (ns: string) => ({
                 to: (_room: string) => ({
@@ -1170,10 +1171,34 @@ describe('MessageService.sendMessage deliveryMode', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => new Set(['cli-1']) } }
+                adapter: { rooms: { get: () => sockets.size > 0 ? sockets : undefined } }
             })
         } as unknown as Server
         return { io, cliEmitted }
+    }
+
+    for (const socketCount of [0, 2]) {
+        it(`keeps an immediate prompt queued with ${socketCount} CLI sockets, then replays once after restart`, async () => {
+            const store = makeStore()
+            const session = makeSession(store, `dispatch-socket-count-${socketCount}`)
+            const unavailable = makeTrackingIo(socketCount)
+            const service = new MessageService(store, unavailable.io, makePublisher() as any)
+
+            await service.sendMessage(session.id, {
+                text: 'deliver after one runner attaches',
+                localId: `socket-count-${socketCount}`
+            })
+
+            expect(unavailable.cliEmitted).toHaveLength(0)
+            expect(store.messages.lookupQueuedMessage(session.id, `socket-count-${socketCount}`).status).toBe('queued')
+
+            const available = makeTrackingIo(1)
+            const restarted = new MessageService(store, available.io, makePublisher() as any)
+            expect(restarted.replayImmediateQueuedMessages(session.id)).toBe(1)
+            expect(restarted.replayImmediateQueuedMessages(session.id)).toBe(0)
+            expect(available.cliEmitted).toHaveLength(1)
+            expect(store.messages.lookupQueuedMessage(session.id, `socket-count-${socketCount}`).status).toBe('dispatching')
+        })
     }
 
     it('persists Pi steer provenance but downgrades every deferred CLI delivery to queue', async () => {
