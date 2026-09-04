@@ -141,6 +141,15 @@ export class MessageService {
         }
     }
 
+    private hasSingleCliSocket(sessionId: string): boolean {
+        const adapter = this.io.of('/cli').adapter
+        // Socket.IO always provides an adapter. Some focused service tests use
+        // a minimal namespace stub and exercise behavior unrelated to sockets.
+        if (!adapter) return true
+        const room = adapter.rooms.get(`session:${sessionId}`)
+        return room?.size === 1
+    }
+
     private recordConsumedAcknowledgement(
         sessionId: string,
         localId: string,
@@ -700,12 +709,9 @@ export class MessageService {
             this.publisher.emit({ type: 'messages-indeterminate', sessionId, localIds: [message.localId] })
             return { status: 'retry-unavailable', localId: message.localId }
         }
-        const requeued = this.store.messages.setMessagesDeliveryState(sessionId, [message.localId], 'queued')
-        if (requeued === 0) {
-            const settled = this.store.messages.lookupQueuedMessage(sessionId, message.id)
-            if (settled.status === 'invoked') return { status: 'invoked', message: toDecryptedMessage(settled.message) }
-            return { status: 'retry-unavailable', localId: message.localId }
-        }
+        // The CLI accepted the retry, but only messages-consumed proves that
+        // the agent invoked it. Keep the durable claim held across hub or
+        // runner restarts so reconnect backfill cannot execute it twice.
         this.publisher.emit({ type: 'messages-requeued', sessionId, localIds: [message.localId] })
         return { status: 'retried', localId: message.localId }
         } finally {
@@ -836,7 +842,11 @@ export class MessageService {
         const cliContent = inserted.inserted
             ? msg.content
             : contentForDeferredDelivery(msg.content)
-        const shouldEmitToCli = msg.deliveryState !== 'indeterminate'
+        // The SQLite localId row is the durable dispatch claim. A repeated
+        // request can arrive after the first response was lost or after this
+        // hub restarts. It must acknowledge the existing row without sending
+        // the prompt to the CLI a second time.
+        let shouldEmitToCli = inserted.inserted && msg.deliveryState !== 'indeterminate'
         this.onSessionActivity?.(actualSessionId, msg.createdAt)
 
         // Only emit to CLI if the message is not scheduled for the future.
@@ -846,7 +856,12 @@ export class MessageService {
         // the pre-insert `now` capture could misclassify a borderline scheduledAt
         // as future when it has already become past by the time we check.
         const isFutureScheduled = msg.scheduledAt !== null && msg.scheduledAt > Date.now()
-        if (shouldEmitToCli && !isFutureScheduled && !this.store.isOpenCodeClearDeliveryGated(actualSessionId)) {
+        const deliveryGated = this.store.isOpenCodeClearDeliveryGated(actualSessionId)
+        if (shouldEmitToCli && !isFutureScheduled && !deliveryGated && msg.localId) {
+            shouldEmitToCli = this.hasSingleCliSocket(actualSessionId)
+                && this.store.messages.claimMessagesForDispatch(actualSessionId, [msg.localId]) === 1
+        }
+        if (shouldEmitToCli && !isFutureScheduled && !deliveryGated) {
             const update = {
                 id: msg.id,
                 seq: msg.seq,
@@ -919,7 +934,10 @@ export class MessageService {
     replayImmediateQueuedMessages(sessionId: string): number {
         if (this.store.isOpenCodeClearDeliveryGated(sessionId)) return 0
         const queued = this.store.messages.getImmediateQueuedLocalMessages(sessionId)
+        if (queued.length === 0 || !this.hasSingleCliSocket(sessionId)) return 0
+        let emitted = 0
         for (const msg of queued) {
+            if (!msg.localId || this.store.messages.claimMessagesForDispatch(sessionId, [msg.localId]) !== 1) continue
             const update = {
                 id: msg.id,
                 seq: msg.seq,
@@ -937,8 +955,9 @@ export class MessageService {
                 }
             }
             this.io.of('/cli').to(`session:${sessionId}`).emit('update', update)
+            emitted++
         }
-        return queued.length
+        return emitted
     }
 
     /** Release a completed clear handoff in finalized seq order. */
@@ -946,7 +965,10 @@ export class MessageService {
         if (this.store.isOpenCodeClearDeliveryGated(sessionId)) return 0
         const queued = this.store.messages.getUninvokedLocalMessages(sessionId, { deliverableOnly: true })
             .filter((msg) => msg.scheduledAt === null || msg.scheduledAt <= now)
+        if (queued.length === 0 || !this.hasSingleCliSocket(sessionId)) return 0
+        let emitted = 0
         for (const msg of queued) {
+            if (!msg.localId || this.store.messages.claimMessagesForDispatch(sessionId, [msg.localId]) !== 1) continue
             const update = {
                 id: msg.id,
                 seq: msg.seq,
@@ -964,17 +986,17 @@ export class MessageService {
                 }
             }
             this.io.of('/cli').to(`session:${sessionId}`).emit('update', update)
+            emitted++
         }
-        return queued.length
+        return emitted
     }
 
     /** Called by the hub 5-second tick (syncEngine.expireInactive).
      *
      * Finds all scheduled messages whose scheduled_at <= now and emits them to
      * the CLI via socket.io.  Does NOT call markMessagesInvoked — the CLI ack
-     * (messages-consumed) handles that.  This means a message is re-emitted on
-     * each tick until the CLI acks it, which is the correct behaviour for hub
-     * restart scenarios (pitfall #2 guard).
+     * (messages-consumed) handles that. The durable dispatch claim prevents a
+     * hub or runner restart from invoking the same prompt again before its ACK.
      *
      * Race window with cancel: this tick widens the cancel race to 5 s for
      * scheduled messages (vs near-zero for immediate-queued ones). If the CLI
@@ -994,8 +1016,15 @@ export class MessageService {
             if (skipSessionIds?.has(msg.sessionId) || deliveryGated) {
                 continue
             }
+            const cliNamespace = this.io.of('/cli')
+            const roomName = `session:${msg.sessionId}`
+            if (!this.hasSingleCliSocket(msg.sessionId)) continue
             const localId = msg.localId
-            if (typeof localId === 'string' && !this.scheduledMatureNotifiedLocalIds.has(localId)) {
+            if (typeof localId !== 'string'
+                || this.store.messages.claimMessagesForDispatch(msg.sessionId, [localId]) !== 1) {
+                continue
+            }
+            if (!this.scheduledMatureNotifiedLocalIds.has(localId)) {
                 this.scheduledMatureNotifiedLocalIds.add(localId)
                 maturedSessionIds.add(msg.sessionId)
             }
@@ -1015,9 +1044,8 @@ export class MessageService {
                     }
                 }
             }
-            this.io.of('/cli').to(`session:${msg.sessionId}`).emit('update', update)
-            // NOTE: do NOT call markMessagesInvoked here (pitfall #2).
-            // CLI ack (messages-consumed) will handle invoked_at stamping.
+            cliNamespace.to(roomName).emit('update', update)
+            // The CLI ACK owns the final invoked_at stamp.
         }
         for (const sessionId of maturedSessionIds) {
             this.publisher.emit({ type: 'scheduled-matured', sessionId })

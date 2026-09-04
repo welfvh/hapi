@@ -967,7 +967,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
                         emit: () => {}
                     })
                 }),
-                adapter: { rooms: { get: () => undefined } }
+                adapter: { rooms: { get: () => new Set(['cli-1']) } }
             }),
             _emittedUpdates: emittedUpdates
         } as unknown as Server
@@ -987,7 +987,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => undefined } }
+                adapter: { rooms: { get: () => new Set(['cli-1']) } }
             })
         } as unknown as Server
 
@@ -1027,7 +1027,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => undefined } }
+                adapter: { rooms: { get: () => new Set(['cli-1']) } }
             })
         } as unknown as Server
 
@@ -1056,7 +1056,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => undefined } }
+                adapter: { rooms: { get: () => new Set(['cli-1']) } }
             })
         } as unknown as Server
 
@@ -1089,7 +1089,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => undefined } }
+                adapter: { rooms: { get: () => new Set(['cli-1']) } }
             })
         } as unknown as Server
 
@@ -1160,8 +1160,9 @@ describe('MessageService.sendMessage with scheduledAt', () => {
 })
 
 describe('MessageService.sendMessage deliveryMode', () => {
-    function makeTrackingIo(): { io: Server; cliEmitted: unknown[] } {
+    function makeTrackingIo(socketCount = 1): { io: Server; cliEmitted: unknown[] } {
         const cliEmitted: unknown[] = []
+        const sockets = new Set(Array.from({ length: socketCount }, (_, index) => `cli-${index}`))
         const io = {
             of: (ns: string) => ({
                 to: (_room: string) => ({
@@ -1170,10 +1171,34 @@ describe('MessageService.sendMessage deliveryMode', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => undefined } }
+                adapter: { rooms: { get: () => sockets.size > 0 ? sockets : undefined } }
             })
         } as unknown as Server
         return { io, cliEmitted }
+    }
+
+    for (const socketCount of [0, 2]) {
+        it(`keeps an immediate prompt queued with ${socketCount} CLI sockets, then replays once after restart`, async () => {
+            const store = makeStore()
+            const session = makeSession(store, `dispatch-socket-count-${socketCount}`)
+            const unavailable = makeTrackingIo(socketCount)
+            const service = new MessageService(store, unavailable.io, makePublisher() as any)
+
+            await service.sendMessage(session.id, {
+                text: 'deliver after one runner attaches',
+                localId: `socket-count-${socketCount}`
+            })
+
+            expect(unavailable.cliEmitted).toHaveLength(0)
+            expect(store.messages.lookupQueuedMessage(session.id, `socket-count-${socketCount}`).status).toBe('queued')
+
+            const available = makeTrackingIo(1)
+            const restarted = new MessageService(store, available.io, makePublisher() as any)
+            expect(restarted.replayImmediateQueuedMessages(session.id)).toBe(1)
+            expect(restarted.replayImmediateQueuedMessages(session.id)).toBe(0)
+            expect(available.cliEmitted).toHaveLength(1)
+            expect(store.messages.lookupQueuedMessage(session.id, `socket-count-${socketCount}`).status).toBe('dispatching')
+        })
     }
 
     it('persists Pi steer provenance but downgrades every deferred CLI delivery to queue', async () => {
@@ -1205,25 +1230,18 @@ describe('MessageService.sendMessage deliveryMode', () => {
             body: { message: { content: { meta: { deliveryMode: 'steer' } } } }
         })
 
-        expect(service.replayImmediateQueuedMessages(session.id)).toBe(1)
-        expect(cliEmitted).toHaveLength(2)
-        expect(cliEmitted[1]).toMatchObject({
-            body: { message: { content: { meta: { deliveryMode: 'queue' } } } }
-        })
+        expect(service.replayImmediateQueuedMessages(session.id)).toBe(0)
+        expect(cliEmitted).toHaveLength(1)
 
         const backfill = service.getDeliverableMessagesAfter(session.id, {
             afterSeq: 0,
             limit: 10,
             now: Date.now()
         })
-        expect(backfill).toHaveLength(1)
-        expect(backfill[0]?.content).toMatchObject({ meta: { deliveryMode: 'queue' } })
+        expect(backfill).toHaveLength(0)
 
-        expect(service.releaseDeliverableQueuedMessages(session.id)).toBe(1)
-        expect(cliEmitted).toHaveLength(3)
-        expect(cliEmitted[2]).toMatchObject({
-            body: { message: { content: { meta: { deliveryMode: 'queue' } } } }
-        })
+        expect(service.releaseDeliverableQueuedMessages(session.id)).toBe(0)
+        expect(cliEmitted).toHaveLength(1)
 
         // Deferred delivery is a view transformation only. The database keeps
         // the original provenance for Web display and diagnostics.
@@ -1233,7 +1251,7 @@ describe('MessageService.sendMessage deliveryMode', () => {
         })
     })
 
-    it('delivers a duplicate-localId retry as queue even when the stored row retains steer', async () => {
+    it('does not dispatch a duplicate localId after the hub service restarts', async () => {
         const store = makeStore()
         const session = store.sessions.getOrCreateSession(
             'delivery-mode-duplicate-pi',
@@ -1249,18 +1267,18 @@ describe('MessageService.sendMessage deliveryMode', () => {
             localId: 'duplicate-steer',
             deliveryMode: 'steer'
         })
-        await service.sendMessage(session.id, {
+        // A fresh service proves that the idempotency claim lives in SQLite,
+        // not an in-memory set that disappears with the hub process.
+        const restartedService = new MessageService(store, io, makePublisher() as any)
+        await restartedService.sendMessage(session.id, {
             text: 'retry requests queue',
             localId: 'duplicate-steer',
             deliveryMode: 'queue'
         })
 
-        expect(cliEmitted).toHaveLength(2)
+        expect(cliEmitted).toHaveLength(1)
         expect(cliEmitted[0]).toMatchObject({
             body: { message: { content: { meta: { deliveryMode: 'steer' } } } }
-        })
-        expect(cliEmitted[1]).toMatchObject({
-            body: { message: { content: { meta: { deliveryMode: 'queue' } } } }
         })
         const rows = store.messages.getUninvokedLocalMessages(session.id)
         expect(rows).toHaveLength(1)
@@ -1269,6 +1287,54 @@ describe('MessageService.sendMessage deliveryMode', () => {
             content: { text: 'original steer whose response is lost' },
             meta: { sentFrom: 'webapp', deliveryMode: 'steer' }
         })
+    })
+
+    it('explicitly retries a dispatch held across a runner restart', async () => {
+        const store = makeStore()
+        const session = makeSession(store, 'dispatch-restart-retry')
+        const first = makeTrackingIo()
+        const service = new MessageService(store, first.io, makePublisher() as any)
+
+        await service.sendMessage(session.id, {
+            text: 'recover once',
+            localId: 'restart-held'
+        })
+        expect(first.cliEmitted).toHaveLength(1)
+        expect(store.messages.lookupQueuedMessage(session.id, 'restart-held').status).toBe('dispatching')
+
+        const retryUpdates: any[] = []
+        const retryIo = {
+            of: () => ({
+                adapter: { rooms: { get: () => new Set(['new-runner']) } },
+                to: () => ({
+                    timeout: () => ({
+                        emit: (_event: string, update: any, callback: (error: Error | null, responses: any[]) => void) => {
+                            retryUpdates.push(update)
+                            callback(null, update.body.t === 'retry-queued-message'
+                                ? [{ accepted: true }]
+                                : [{ removed: false }])
+                        }
+                    }),
+                    emit: () => {}
+                })
+            })
+        } as unknown as Server
+        const restarted = new MessageService(store, retryIo, makePublisher() as any)
+
+        expect(await restarted.retryIndeterminateMessage(session.id, 'restart-held')).toEqual({
+            status: 'retried',
+            localId: 'restart-held'
+        })
+        expect(retryUpdates.map(update => update.body.t)).toEqual([
+            'cancel-queued-message',
+            'retry-queued-message'
+        ])
+        expect(store.messages.lookupQueuedMessage(session.id, 'restart-held').status).toBe('dispatching')
+
+        const afterRetryRestart = makeTrackingIo()
+        const restartedAgain = new MessageService(store, afterRetryRestart.io, makePublisher() as any)
+        expect(restartedAgain.releaseDeliverableQueuedMessages(session.id)).toBe(0)
+        expect(afterRetryRestart.cliEmitted).toHaveLength(0)
     })
 
     it('downgrades a legacy persisted steer through the mature scheduled scan', () => {
@@ -1404,7 +1470,7 @@ describe('MessageService.releaseMatureScheduledMessages', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => undefined } }
+                adapter: { rooms: { get: () => new Set(['cli-1']) } }
             })
         } as unknown as Server
         return { io, cliEmitted }
@@ -1480,7 +1546,7 @@ describe('MessageService.releaseMatureScheduledMessages', () => {
         expect(matured).toEqual([{ type: 'scheduled-matured', sessionId: session.id }])
     })
 
-    it('does NOT call markMessagesInvoked (pitfall #2 guard): message is re-emitted on next tick', async () => {
+    it('holds a dispatched scheduled message across later ticks until its ACK', async () => {
         const store = makeStore()
         const session = makeSession(store, 'release-no-mark')
         const publisher = makePublisher()
@@ -1496,14 +1562,15 @@ describe('MessageService.releaseMatureScheduledMessages', () => {
         service.releaseMatureScheduledMessages(now)
         expect(cliEmitted).toHaveLength(1)
 
-        // Second tick (simulating hub restart without CLI ack): must re-emit
+        // A later tick must not invoke the same prompt again without an ACK.
         service.releaseMatureScheduledMessages(now + 5_000)
-        expect(cliEmitted).toHaveLength(2)
+        expect(cliEmitted).toHaveLength(1)
 
         // invoked_at must still be NULL (not marked)
         const msgs = store.messages.getMessages(session.id)
         const msg = msgs.find(m => m.localId === 'local-nm')!
         expect(msg.invokedAt).toBeNull()
+        expect(msg.deliveryState).toBe('indeterminate')
     })
 
     it('does NOT emit future scheduled messages', async () => {
@@ -1570,7 +1637,7 @@ describe('MessageService.releaseMatureScheduledMessages', () => {
                         },
                         timeout: (_ms: number) => ({ emit: () => {} })
                     }),
-                    adapter: { rooms: { get: () => undefined } }
+                    adapter: { rooms: { get: () => new Set(['cli-1']) } }
                 })
             } as unknown as Server
             const publisher2 = { emit: () => {}, events: [] }
@@ -1605,7 +1672,7 @@ describe('MessageService.sweepImmediateQueuedOnSessionEnd — scheduled rows are
                     emit: () => {},
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => undefined } }
+                adapter: { rooms: { get: () => new Set(['cli-1']) } }
             })
         } as unknown as Server
     }
@@ -1620,7 +1687,7 @@ describe('MessageService.sweepImmediateQueuedOnSessionEnd — scheduled rows are
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => undefined } }
+                adapter: { rooms: { get: () => new Set(['cli-1']) } }
             })
         } as unknown as Server
         return { io, cliEmitted }
@@ -1660,7 +1727,7 @@ describe('MessageService.sweepImmediateQueuedOnSessionEnd — scheduled rows are
         expect(cliEmitted).toHaveLength(1)
     })
 
-    it('mature scheduled row already emitted but not yet acked stays uninvoked across session-end and is re-emitted', () => {
+    it('mature scheduled row already emitted but not acked stays held across session-end', () => {
         // R4 race scenario B: mature scan emits at T+0, CLI receives but dies
         // before sending messages-consumed.  Session-end fires while invoked_at
         // is still NULL.  The sweep must preserve the row (scheduled_at IS NOT
@@ -1699,11 +1766,12 @@ describe('MessageService.sweepImmediateQueuedOnSessionEnd — scheduled rows are
                 .find(m => m.localId === 'local-noack')?.invokedAt
         ).toBeNull()
 
-        // Re-attach: next mature-scan tick re-emits the same row.
+        // Re-attach: the row stays held to avoid a duplicate agent turn. The
+        // explicit retry endpoint resolves this durable ambiguous state.
         const { io: io2, cliEmitted: emitted2 } = makeTrackingIo()
         const service2 = new MessageService(store, io2, publisher as any)
         service2.releaseMatureScheduledMessages(now + 5000)
-        expect(emitted2).toHaveLength(1)
+        expect(emitted2).toHaveLength(0)
     })
 
     it('immediate-queued (no scheduled_at) IS swept and stamped invoked at session-end', () => {

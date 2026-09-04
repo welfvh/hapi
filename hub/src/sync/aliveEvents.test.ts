@@ -16,11 +16,12 @@ function createPublisher(events: SyncEvent[]): EventPublisher {
 }
 
 describe('alive incremental events', () => {
-    it('replays durable immediate prompts on every attach until consumed', () => {
+    it('dispatches a durable immediate prompt once across repeated attaches', () => {
         const store = new Store(':memory:')
         const emitted: Array<{ body?: { t?: string; message?: { localId?: string | null } } }> = []
         const io = {
             of: () => ({
+                adapter: { rooms: { get: () => new Set(['cli-1']) } },
                 to: () => ({ emit: (_event: string, payload: unknown) => emitted.push(payload as typeof emitted[number]) })
             })
         }
@@ -36,13 +37,13 @@ describe('alive incremental events', () => {
             engine.handleSessionAlive({ sid: session.id, time: Date.now() })
             engine.handleSessionAlive({ sid: session.id, time: Date.now() + 1 })
             expect(emitted.map((update) => update.body?.message?.localId)).toEqual([
-                'queued-before-attach', 'queued-before-attach'
+                'queued-before-attach'
             ])
 
             store.messages.markMessagesInvoked(session.id, ['queued-before-attach'], Date.now())
             engine.handleSessionAlive({ sid: session.id, time: Date.now() + 2 })
             expect(emitted.map((update) => update.body?.message?.localId)).toEqual([
-                'queued-before-attach', 'queued-before-attach'
+                'queued-before-attach'
             ])
         } finally { engine.stop() }
     })
@@ -149,6 +150,7 @@ describe('alive incremental events', () => {
         const emittedSocketUpdates: unknown[] = []
         const io = {
             of: () => ({
+                adapter: { rooms: { get: () => new Set(['cli-1']) } },
                 to: () => ({
                     emit: (_event: string, payload: unknown) => {
                         emittedSocketUpdates.push(payload)
@@ -251,6 +253,7 @@ describe('alive incremental events', () => {
         const store = new Store(':memory:')
         const io = {
             of: () => ({
+                adapter: { rooms: { get: () => new Set(['cli-1']) } },
                 to: () => ({ emit() {} })
             })
         }
@@ -296,6 +299,7 @@ describe('alive incremental events', () => {
         const store = new Store(':memory:')
         const io = {
             of: () => ({
+                adapter: { rooms: { get: () => new Set(['cli-1']) } },
                 to: () => ({ emit() {} })
             })
         }
