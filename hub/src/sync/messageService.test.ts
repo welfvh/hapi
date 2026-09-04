@@ -1264,6 +1264,48 @@ describe('MessageService.sendMessage deliveryMode', () => {
         })
     })
 
+    it('explicitly retries a dispatch held across a runner restart', async () => {
+        const store = makeStore()
+        const session = makeSession(store, 'dispatch-restart-retry')
+        const first = makeTrackingIo()
+        const service = new MessageService(store, first.io, makePublisher() as any)
+
+        await service.sendMessage(session.id, {
+            text: 'recover once',
+            localId: 'restart-held'
+        })
+        expect(first.cliEmitted).toHaveLength(1)
+        expect(store.messages.lookupQueuedMessage(session.id, 'restart-held').status).toBe('dispatching')
+
+        const retryUpdates: any[] = []
+        const retryIo = {
+            of: () => ({
+                adapter: { rooms: { get: () => new Set(['new-runner']) } },
+                to: () => ({
+                    timeout: () => ({
+                        emit: (_event: string, update: any, callback: (error: Error | null, responses: any[]) => void) => {
+                            retryUpdates.push(update)
+                            callback(null, update.body.t === 'retry-queued-message'
+                                ? [{ accepted: true }]
+                                : [{ removed: false }])
+                        }
+                    }),
+                    emit: () => {}
+                })
+            })
+        } as unknown as Server
+        const restarted = new MessageService(store, retryIo, makePublisher() as any)
+
+        expect(await restarted.retryIndeterminateMessage(session.id, 'restart-held')).toEqual({
+            status: 'retried',
+            localId: 'restart-held'
+        })
+        expect(retryUpdates.map(update => update.body.t)).toEqual([
+            'cancel-queued-message',
+            'retry-queued-message'
+        ])
+    })
+
     it('downgrades a legacy persisted steer through the mature scheduled scan', () => {
         const store = makeStore()
         const session = store.sessions.getOrCreateSession(
