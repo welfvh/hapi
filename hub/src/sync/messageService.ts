@@ -709,12 +709,9 @@ export class MessageService {
             this.publisher.emit({ type: 'messages-indeterminate', sessionId, localIds: [message.localId] })
             return { status: 'retry-unavailable', localId: message.localId }
         }
-        const requeued = this.store.messages.setMessagesDeliveryState(sessionId, [message.localId], 'queued')
-        if (requeued === 0) {
-            const settled = this.store.messages.lookupQueuedMessage(sessionId, message.id)
-            if (settled.status === 'invoked') return { status: 'invoked', message: toDecryptedMessage(settled.message) }
-            return { status: 'retry-unavailable', localId: message.localId }
-        }
+        // The CLI accepted the retry, but only messages-consumed proves that
+        // the agent invoked it. Keep the durable claim held across hub or
+        // runner restarts so reconnect backfill cannot execute it twice.
         this.publisher.emit({ type: 'messages-requeued', sessionId, localIds: [message.localId] })
         return { status: 'retried', localId: message.localId }
         } finally {

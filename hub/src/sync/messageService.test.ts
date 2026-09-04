@@ -1329,6 +1329,12 @@ describe('MessageService.sendMessage deliveryMode', () => {
             'cancel-queued-message',
             'retry-queued-message'
         ])
+        expect(store.messages.lookupQueuedMessage(session.id, 'restart-held').status).toBe('dispatching')
+
+        const afterRetryRestart = makeTrackingIo()
+        const restartedAgain = new MessageService(store, afterRetryRestart.io, makePublisher() as any)
+        expect(restartedAgain.releaseDeliverableQueuedMessages(session.id)).toBe(0)
+        expect(afterRetryRestart.cliEmitted).toHaveLength(0)
     })
 
     it('downgrades a legacy persisted steer through the mature scheduled scan', () => {
