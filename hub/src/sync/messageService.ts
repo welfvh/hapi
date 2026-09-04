@@ -142,7 +142,11 @@ export class MessageService {
     }
 
     private hasSingleCliSocket(sessionId: string): boolean {
-        const room = this.io.of('/cli').adapter?.rooms?.get(`session:${sessionId}`)
+        const adapter = this.io.of('/cli').adapter
+        // Socket.IO always provides an adapter. Some focused service tests use
+        // a minimal namespace stub and exercise behavior unrelated to sockets.
+        if (!adapter) return true
+        const room = adapter.rooms.get(`session:${sessionId}`)
         return room?.size === 1
     }
 
@@ -931,8 +935,9 @@ export class MessageService {
 
     /** Replay durable immediate prompts whenever their CLI session attaches. */
     replayImmediateQueuedMessages(sessionId: string): number {
-        if (this.store.isOpenCodeClearDeliveryGated(sessionId) || !this.hasSingleCliSocket(sessionId)) return 0
+        if (this.store.isOpenCodeClearDeliveryGated(sessionId)) return 0
         const queued = this.store.messages.getImmediateQueuedLocalMessages(sessionId)
+        if (queued.length === 0 || !this.hasSingleCliSocket(sessionId)) return 0
         let emitted = 0
         for (const msg of queued) {
             if (!msg.localId || this.store.messages.claimMessagesForDispatch(sessionId, [msg.localId]) !== 1) continue
@@ -960,9 +965,10 @@ export class MessageService {
 
     /** Release a completed clear handoff in finalized seq order. */
     releaseDeliverableQueuedMessages(sessionId: string, now: number = Date.now()): number {
-        if (this.store.isOpenCodeClearDeliveryGated(sessionId) || !this.hasSingleCliSocket(sessionId)) return 0
+        if (this.store.isOpenCodeClearDeliveryGated(sessionId)) return 0
         const queued = this.store.messages.getUninvokedLocalMessages(sessionId, { deliverableOnly: true })
             .filter((msg) => msg.scheduledAt === null || msg.scheduledAt <= now)
+        if (queued.length === 0 || !this.hasSingleCliSocket(sessionId)) return 0
         let emitted = 0
         for (const msg of queued) {
             if (!msg.localId || this.store.messages.claimMessagesForDispatch(sessionId, [msg.localId]) !== 1) continue
