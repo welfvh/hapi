@@ -1507,12 +1507,13 @@ export function buildCliArgs(
   }
   const startingMode = options.startingMode || 'remote';
   args.push('--hapi-starting-mode', startingMode, '--started-by', 'runner');
-  // Codex, Cursor ACP, OpenCode, Pi native resume, and Claude message-level
-  // forks reuse the original HAPI row via --existing-session-id.
-  if (agent === 'codex' || agent === 'cursor' || agent === 'pi'
+  // Resumed agents reuse the durable HAPI row via --existing-session-id.
+  // Claude needs this for ordinary resumes as well as message-level forks;
+  // otherwise its native --resume process creates a replacement HAPI row.
+  if (agent === 'codex' || agent === 'claude' || agent === 'cursor' || agent === 'pi'
       || agent === 'opencode'
       || agent === 'agy'
-      || (agentCommand === 'claude' && options.forkSession)) {
+  ) {
     const existingSessionId = options.existingSessionId ?? options.sessionId;
     if (existingSessionId) {
       args.push('--existing-session-id', existingSessionId);

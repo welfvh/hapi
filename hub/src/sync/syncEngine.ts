@@ -63,6 +63,7 @@ import { ingestNotifySummaryFromMessage } from './workGraphNotifyIngest'
 
 type PiResumeAttempt = NonNullable<NonNullable<Session['metadata']>['piResumeAttempt']>
 type PtyResumeAttempt = NonNullable<NonNullable<Session['metadata']>['ptyResumeAttempt']>
+type StableIdentityResumeAttempt = NonNullable<NonNullable<Session['metadata']>['stableIdentityResumeAttempt']>
 
 export type { Session, SyncEvent } from '@hapi/protocol/types'
 export type { Machine } from './machineCache'
@@ -190,6 +191,8 @@ export class SyncEngine {
     private readonly piResumeQuarantinedIds = new Set<string>()
     /** Unexpected version-skew temp child -> original row whose retry is blocked until child ends. */
     private readonly piUnexpectedTempOriginalIds = new Map<string, string>()
+    /** Codex/Claude rows whose runner spawn must reattach to the same durable HAPI id. */
+    private readonly stableIdentityResumeInFlightCounts = new Map<string, number>()
     /** Serialize scratchlist uploads per session so disk-byte caps cannot race. */
     private readonly scratchlistUploadTails = new Map<string, Promise<unknown>>()
     /** Coalesce duplicate clear requests so retries cannot spawn two fresh sessions. */
@@ -523,6 +526,15 @@ export class SyncEngine {
         collaborationMode?: CodexCollaborationMode
     }): void {
         this.sessionCache.handleSessionAlive(payload)
+        const liveSession = this.sessionCache.getSession(payload.sid)
+        if (
+            liveSession?.metadata?.stableIdentityResumeAttempt
+            && (liveSession.metadata.flavor === 'codex' || liveSession.metadata.flavor === 'claude')
+        ) {
+            void this.writeStableIdentityResumeAttempt(payload.sid, liveSession.namespace, null)
+                .then(() => this.triggerDedupIfNeeded(payload.sid))
+                .catch(() => {})
+        }
         this.messageService.replayImmediateQueuedMessages(payload.sid)
         this.triggerDedupIfNeeded(payload.sid)
     }
@@ -547,6 +559,15 @@ export class SyncEngine {
 
     handleSessionEnd(payload: { sid: string; time: number; reason?: SessionEndReason }): void {
         const before = this.sessionCache.getSession(payload.sid)
+        const stableIdentityAttemptOwner = before?.metadata?.stableIdentityResumeAttempt
+            ? before
+            : this.sessionCache.getSessions().find(
+                (session) => session.metadata?.stableIdentityResumeAttempt !== undefined
+                    && (
+                        session.metadata.stableIdentityResumeAttempt.childSessionId === payload.sid
+                        || this.sharesStableIdentityAgentSessionId(session.metadata, before?.metadata ?? null)
+                    )
+            )
         if (before?.metadata?.opencodeClearOperation?.state === 'reserved' && payload.reason !== 'cleared') {
             const operation = before.metadata.opencodeClearOperation
             if (this.transitionClearOperation(payload.sid, before.namespace, operation, 'abort-needed')) {
@@ -583,6 +604,25 @@ export class SyncEngine {
         }
         if (ownsPtyAttempt) {
             void this.writePtyResumeAttempt(payload.sid, before!.namespace, null).catch(() => {})
+        }
+        if (
+            stableIdentityAttemptOwner
+            && !this.stableIdentityResumeInFlightCounts.has(stableIdentityAttemptOwner.id)
+        ) {
+            void (async () => {
+                if (stableIdentityAttemptOwner.id !== payload.sid) {
+                    const endedChild = this.sessionCache.getSession(payload.sid)
+                    if (endedChild && !endedChild.active) {
+                        await this.sessionCache.deleteSession(payload.sid)
+                    }
+                }
+                await this.writeStableIdentityResumeAttempt(
+                    stableIdentityAttemptOwner.id,
+                    stableIdentityAttemptOwner.namespace,
+                    null
+                )
+                this.triggerDedupIfNeeded(stableIdentityAttemptOwner.id)
+            })().catch(() => {})
         }
 
         // Notify agent-terminal subscribers so the web UI shows a clear
@@ -2824,6 +2864,28 @@ export class SyncEngine {
             this.ptyResumeQuarantinedIds.delete(access.sessionId)
             initialSession = this.sessionCache.getSessionByNamespace(access.sessionId, namespace) ?? initialSession
         }
+        if (
+            initialSession.metadata?.stableIdentityResumeAttempt
+            && (initialSession.metadata.flavor === 'codex' || initialSession.metadata.flavor === 'claude')
+        ) {
+            if (initialSession.active) {
+                await this.writeStableIdentityResumeAttempt(access.sessionId, namespace, null).catch(() => {})
+            } else {
+                const concurrentAttempts = this.stableIdentityResumeInFlightCounts.get(access.sessionId) ?? 0
+                this.stableIdentityResumeInFlightCounts.set(access.sessionId, concurrentAttempts + 1)
+                const reconciled = await this.reconcilePersistedStableIdentityResumeAttempt(initialSession)
+                    .finally(() => this.finishStableIdentityResume(access.sessionId))
+                if (!reconciled) {
+                    return {
+                        type: 'error',
+                        message: 'A process from the previous reactivation attempt is still running',
+                        code: 'resume_failed',
+                        rollbackSafe: false
+                    }
+                }
+                initialSession = this.sessionCache.getSessionByNamespace(access.sessionId, namespace) ?? initialSession
+            }
+        }
         if (initialSession.active) {
             return { type: 'success', sessionId: access.sessionId }
         }
@@ -2873,6 +2935,7 @@ export class SyncEngine {
         }
 
         const requiresPiNativeReady = flavor === 'pi' && resumeToken !== undefined
+        const requiresStableHubIdentity = flavor === 'codex' || flavor === 'claude'
         if (requiresPiNativeReady) {
             if (this.isPiResumeBlocked(access.sessionId)) {
                 return { type: 'error', message: 'Pi resume is already in progress', code: 'resume_failed' }
@@ -2958,6 +3021,24 @@ export class SyncEngine {
             this.sessionReadyIds.delete(access.sessionId)
         }
         let piResumeSucceeded = false
+        if (requiresStableHubIdentity) {
+            const concurrentAttempts = this.stableIdentityResumeInFlightCounts.get(access.sessionId) ?? 0
+            this.stableIdentityResumeInFlightCounts.set(access.sessionId, concurrentAttempts + 1)
+            try {
+                await this.writeStableIdentityResumeAttempt(access.sessionId, namespace, {
+                    state: 'resuming',
+                    machineId: targetMachine.id,
+                    startedAt: Date.now()
+                })
+            } catch {
+                this.finishStableIdentityResume(access.sessionId)
+                return {
+                    type: 'error',
+                    message: 'Failed to record stable-identity reactivation attempt',
+                    code: 'resume_failed'
+                }
+            }
+        }
         try {
             const spawnResult = await this.rpcGateway.spawnSession(
                 targetMachine.id,
@@ -2979,6 +3060,22 @@ export class SyncEngine {
             )
 
             if (spawnResult.type !== 'success') {
+                if (requiresStableHubIdentity) {
+                    const current = this.sessionCache.getSessionByNamespace(access.sessionId, namespace)
+                    if (current?.active) {
+                        await this.writeStableIdentityResumeAttempt(access.sessionId, namespace, null).catch(() => {})
+                        return { type: 'success', sessionId: access.sessionId }
+                    }
+                    const reconciled = current
+                        ? await this.reconcilePersistedStableIdentityResumeAttempt(current)
+                        : false
+                    return {
+                        type: 'error',
+                        message: spawnResult.message,
+                        code: 'resume_failed',
+                        ...(reconciled ? {} : { rollbackSafe: false })
+                    }
+                }
                 if (requiresPiNativeReady) {
                     const stopped = await this.terminateInPlacePiResume(
                         targetMachine.id,
@@ -3014,8 +3111,39 @@ export class SyncEngine {
                 }
             }
 
+            if (requiresStableHubIdentity && spawnResult.sessionId !== access.sessionId) {
+                const removed = await this.terminateUnexpectedStableIdentityChild(
+                    targetMachine.id,
+                    spawnResult.sessionId,
+                    access.sessionId,
+                    namespace
+                )
+                return {
+                    type: 'error',
+                    message: removed
+                        ? 'Runner returned a replacement session id; the replacement was stopped and the original session was preserved'
+                        : 'Runner returned a replacement session id and its process could not be confirmed stopped',
+                    code: 'resume_failed',
+                    ...(removed ? {} : { rollbackSafe: false })
+                }
+            }
+
             const becameActive = await this.waitForSessionActive(spawnResult.sessionId)
             if (!becameActive) {
+                if (requiresStableHubIdentity) {
+                    const current = this.sessionCache.getSessionByNamespace(access.sessionId, namespace)
+                    const reconciled = current
+                        ? await this.reconcilePersistedStableIdentityResumeAttempt(current)
+                        : false
+                    return {
+                        type: 'error',
+                        message: reconciled
+                            ? 'Session failed to become active'
+                            : 'Session failed to become active and its process could not be confirmed stopped',
+                        code: 'resume_failed',
+                        ...(reconciled ? {} : { rollbackSafe: false })
+                    }
+                }
                 if (resumedStartingMode === 'pty') {
                     const current = this.sessionCache.getSessionByNamespace(access.sessionId, namespace)
                     const stopped = current
@@ -3148,6 +3276,18 @@ export class SyncEngine {
 
             this.sessionCache.markSessionActive(spawnResult.sessionId)
             piResumeSucceeded = true
+            if (requiresStableHubIdentity) {
+                try {
+                    await this.writeStableIdentityResumeAttempt(access.sessionId, namespace, null)
+                } catch {
+                    return {
+                        type: 'error',
+                        message: 'Session resumed but stable-identity cleanup metadata could not be cleared',
+                        code: 'resume_failed',
+                        rollbackSafe: false
+                    }
+                }
+            }
             if (requiresPiNativeReady) await this.writePiResumeAttempt(access.sessionId, namespace, null)
             if (resumedStartingMode === 'pty') {
                 try {
@@ -3165,6 +3305,9 @@ export class SyncEngine {
             }
             return { type: 'success', sessionId: spawnResult.sessionId }
         } finally {
+            if (requiresStableHubIdentity) {
+                this.finishStableIdentityResume(access.sessionId)
+            }
             if (resumedStartingMode === 'pty') {
                 this.ptyResumeInFlightIds.delete(access.sessionId)
             }
@@ -3542,7 +3685,33 @@ export class SyncEngine {
             && (prev?.copilotSessionId ?? null) === (next.copilotSessionId ?? null)
     }
 
+    private sharesStableIdentityAgentSessionId(
+        original: Session['metadata'] | null,
+        candidate: Session['metadata'] | null
+    ): boolean {
+        if (!original || !candidate) return false
+        const field = original.flavor === 'codex'
+            ? 'codexSessionId'
+            : original.flavor === 'claude'
+                ? 'claudeSessionId'
+                : null
+        if (!field) return false
+        const value = original[field]
+        return typeof value === 'string' && value.length > 0 && value === candidate[field]
+    }
+
     private canRunCursorDedup(session: Session): boolean {
+        if (this.stableIdentityResumeInFlightCounts.has(session.id)) return false
+        for (const originalSessionId of this.stableIdentityResumeInFlightCounts.keys()) {
+            const original = this.sessionCache.getSession(originalSessionId)
+            if (original && this.sharesStableIdentityAgentSessionId(original.metadata, session.metadata)) return false
+        }
+        if (session.metadata?.stableIdentityResumeAttempt) return false
+        if (this.sessionCache.getSessions().some((candidate) =>
+            candidate.namespace === session.namespace
+            && candidate.metadata?.stableIdentityResumeAttempt !== undefined
+            && this.sharesStableIdentityAgentSessionId(candidate.metadata, session.metadata)
+        )) return false
         if (this.piResumeInFlightIds.has(session.id) || this.piResumeQuarantinedIds.has(session.id)) return false
         if (session.metadata?.piResumeAttempt) return false
         if (this.sessionCache.getSessions().some((candidate) => candidate.metadata?.piResumeAttempt?.childSessionId === session.id)) return false
@@ -3635,6 +3804,55 @@ export class SyncEngine {
         this.piUnexpectedTempOriginalIds.delete(sessionId)
         await this.writePiResumeAttempt(originalSessionId, namespace, null, true).catch(() => {})
         return true
+    }
+
+    private async terminateUnexpectedStableIdentityChild(
+        machineId: string,
+        childSessionId: string,
+        originalSessionId: string,
+        namespace: string
+    ): Promise<boolean> {
+        try {
+            await this.writeStableIdentityResumeAttempt(originalSessionId, namespace, {
+                state: 'quarantined',
+                machineId,
+                startedAt: Date.now(),
+                childSessionId
+            })
+        } catch {
+            // The pre-spawn `resuming` marker remains the fail-closed guard.
+            // Continue termination so a metadata race cannot strand the child.
+        }
+        let status: 'stopped' | 'already_gone' | 'still_alive'
+        try {
+            status = await this.rpcGateway.stopRunnerSession(machineId, childSessionId)
+        } catch {
+            status = 'still_alive'
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        const child = this.sessionCache.refreshSession(childSessionId)
+            ?? this.sessionCache.getSession(childSessionId)
+        if (status === 'still_alive') return false
+
+        if (child?.active) {
+            this.handleSessionEnd({ sid: childSessionId, time: Date.now(), reason: 'error' })
+        }
+        const remaining = this.sessionCache.getSession(childSessionId)
+        if (remaining && !remaining.active) {
+            await this.sessionCache.deleteSession(childSessionId)
+        }
+        await this.writeStableIdentityResumeAttempt(originalSessionId, namespace, null).catch(() => {})
+        return true
+    }
+
+    private finishStableIdentityResume(sessionId: string): void {
+        const concurrentAttempts = this.stableIdentityResumeInFlightCounts.get(sessionId) ?? 1
+        if (concurrentAttempts <= 1) {
+            this.stableIdentityResumeInFlightCounts.delete(sessionId)
+        } else {
+            this.stableIdentityResumeInFlightCounts.set(sessionId, concurrentAttempts - 1)
+        }
     }
 
     private async quarantinePiResume(sessionId: string, namespace: string, machineId: string): Promise<void> {
@@ -3734,6 +3952,42 @@ export class SyncEngine {
         throw new Error('PTY resume attempt metadata was modified concurrently')
     }
 
+    private async writeStableIdentityResumeAttempt(
+        sessionId: string,
+        namespace: string,
+        attempt: StableIdentityResumeAttempt | null
+    ): Promise<void> {
+        for (let i = 0; i < 5; i += 1) {
+            const current = this.sessionCache.getSessionByNamespace(sessionId, namespace)
+                ?? this.sessionCache.refreshSession(sessionId)
+            if (!current?.metadata) {
+                throw new Error('Stable-identity reactivation metadata is unavailable')
+            }
+            if (!attempt && current.metadata.stableIdentityResumeAttempt === undefined) {
+                return
+            }
+            const next = { ...current.metadata }
+            if (attempt) next.stableIdentityResumeAttempt = attempt
+            else delete next.stableIdentityResumeAttempt
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                next,
+                current.metadataVersion,
+                namespace,
+                { touchUpdatedAt: false }
+            )
+            if (result.result === 'success') {
+                this.sessionCache.refreshSession(sessionId)
+                return
+            }
+            if (result.result !== 'version-mismatch') {
+                throw new Error('Failed to update stable-identity reactivation metadata')
+            }
+            this.sessionCache.refreshSession(sessionId)
+        }
+        throw new Error('Stable-identity reactivation metadata was modified concurrently')
+    }
+
     private async reconcilePersistedPtyResumeAttempt(session: Session): Promise<boolean> {
         const attempt = session.metadata?.ptyResumeAttempt
         if (!attempt) return true
@@ -3757,6 +4011,43 @@ export class SyncEngine {
             this.ptyResumeQuarantinedIds.add(session.id)
             return false
         }
+    }
+
+    private async reconcilePersistedStableIdentityResumeAttempt(session: Session): Promise<boolean> {
+        const attempt = session.metadata?.stableIdentityResumeAttempt
+        if (!attempt) return true
+        const duplicateChildIds = this.sessionCache.getSessions()
+            .filter((candidate) =>
+                candidate.id !== session.id
+                && candidate.namespace === session.namespace
+                && this.sharesStableIdentityAgentSessionId(session.metadata, candidate.metadata)
+            )
+            .map((candidate) => candidate.id)
+        const stopTargetId = attempt.childSessionId ?? session.id
+        let status: 'stopped' | 'already_gone' | 'still_alive'
+        try {
+            status = await this.rpcGateway.stopRunnerSession(attempt.machineId, stopTargetId)
+        } catch {
+            return false
+        }
+        if (status === 'still_alive') return false
+
+        const cleanupIds = new Set(duplicateChildIds)
+        if (attempt.childSessionId && attempt.childSessionId !== session.id) {
+            cleanupIds.add(attempt.childSessionId)
+        }
+        for (const childSessionId of cleanupIds) {
+            const child = this.sessionCache.getSession(childSessionId)
+            if (child?.active) {
+                this.handleSessionEnd({ sid: childSessionId, time: Date.now(), reason: 'error' })
+            }
+            const remaining = this.sessionCache.getSession(childSessionId)
+            if (remaining && !remaining.active) {
+                await this.sessionCache.deleteSession(childSessionId)
+            }
+        }
+        await this.writeStableIdentityResumeAttempt(session.id, session.namespace, null)
+        return true
     }
 
     private async reconcilePersistedPiResumeAttempt(session: Session): Promise<boolean> {

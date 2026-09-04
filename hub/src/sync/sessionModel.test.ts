@@ -1684,7 +1684,7 @@ describe('session model', () => {
         ]).toEqual([
             rootThreadId,
             rootThreadId,
-            outcome.before.metadataVersion + 1,
+            outcome.before.metadataVersion + 3,
             outcome.before.updatedAt
         ])
     })
@@ -1701,7 +1701,7 @@ describe('session model', () => {
         expect(outcome.capturedResumeSessionIds).toEqual([metadataThreadId])
         expect(outcome.after).toMatchObject({
             metadata: { codexSessionId: metadataThreadId },
-            metadataVersion: outcome.before.metadataVersion,
+            metadataVersion: outcome.before.metadataVersion + 2,
             updatedAt: outcome.before.updatedAt
         })
     })
@@ -1770,7 +1770,7 @@ describe('session model', () => {
         ]).toEqual([
             concurrentThreadId,
             concurrentThreadId,
-            outcome.before.metadataVersion,
+            outcome.before.metadataVersion + 2,
             outcome.before.updatedAt
         ])
     })
@@ -1797,7 +1797,7 @@ describe('session model', () => {
             outcome.after.updatedAt
         ]).toEqual([
             messageThreadId,
-            outcome.before.metadataVersion + 1,
+            outcome.before.metadataVersion + 3,
             outcome.before.updatedAt
         ])
     })
@@ -2073,7 +2073,14 @@ describe('session model', () => {
         }
     })
 
-    it('resume succeeds when session-alive races ahead of set-session-config and merges spawned session', async () => {
+    it.each([
+        ['codex', 'codexSessionId', 'codex-thread-race'],
+        ['claude', 'claudeSessionId', 'claude-thread-race']
+    ] as const)('preserves the original %s HAPI id when a runner reports a replacement row', async (
+        flavor,
+        nativeIdField,
+        nativeId
+    ) => {
         const store = new Store(':memory:')
         const engine = new SyncEngine(
             store,
@@ -2089,13 +2096,17 @@ describe('session model', () => {
                     path: '/tmp/project',
                     host: 'localhost',
                     machineId: 'machine-1',
-                    flavor: 'codex',
-                    codexSessionId: 'codex-thread-race'
+                    flavor,
+                    [nativeIdField]: nativeId
                 },
                 null,
                 'default',
-                'gpt-5.4'
+                flavor === 'codex' ? 'gpt-5.4' : 'sonnet'
             )
+            store.messages.addMessage(oldSession.id, {
+                role: 'user',
+                content: { type: 'text', text: 'keep this transcript on the durable id' }
+            })
             engine.getOrCreateMachine(
                 'machine-1',
                 { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' },
@@ -2110,27 +2121,12 @@ describe('session model', () => {
             })
             engine.handleSessionEnd({ sid: oldSession.id, time: Date.now() })
 
-            const spawnedSession = engine.getOrCreateSession(
-                'session-resume-config-race-spawned',
-                {
-                    path: '/tmp/project',
-                    host: 'localhost',
-                    machineId: 'machine-1',
-                    flavor: 'codex',
-                    codexSessionId: 'codex-thread-race'
-                },
-                null,
-                'default',
-                'gpt-5.4'
-            )
-            const spawnedSessionId = spawnedSession.id
+            let spawnedSessionId = ''
             let configRpcCalls = 0
             let mergeCalls = 0
             const sessionCache = (engine as any).sessionCache
-            const mergeSessions = sessionCache.mergeSessions.bind(sessionCache)
-            sessionCache.mergeSessions = async (oldSessionId: string, newSessionId: string, namespace: string) => {
+            sessionCache.mergeSessions = async () => {
                 mergeCalls += 1
-                return mergeSessions(oldSessionId, newSessionId, namespace)
             }
             ;(engine as any).rpcGateway.spawnSession = async (
                 _machineId: string,
@@ -2145,6 +2141,20 @@ describe('session model', () => {
                 _effort?: string,
                 permissionMode?: string
             ) => {
+                const spawnedSession = engine.getOrCreateSession(
+                    'session-resume-config-race-spawned',
+                    {
+                        path: '/tmp/project',
+                        host: 'localhost',
+                        machineId: 'machine-1',
+                        flavor,
+                        [nativeIdField]: nativeId
+                    },
+                    null,
+                    'default',
+                    flavor === 'codex' ? 'gpt-5.4' : 'sonnet'
+                )
+                spawnedSessionId = spawnedSession.id
                 engine.handleSessionAlive({
                     sid: spawnedSessionId,
                     time: Date.now(),
@@ -2152,6 +2162,7 @@ describe('session model', () => {
                 })
                 return { type: 'success', sessionId: spawnedSessionId }
             }
+            ;(engine as any).rpcGateway.stopRunnerSession = async () => 'stopped'
             ;(engine as any).rpcGateway.requestSessionConfig = async () => {
                 configRpcCalls += 1
                 throw new Error('RPC handler not registered')
@@ -2160,13 +2171,262 @@ describe('session model', () => {
 
             const result = await engine.resumeSession(oldSession.id, 'default')
 
-            expect(result).toEqual({ type: 'success', sessionId: spawnedSessionId })
+            expect(result).toEqual({
+                type: 'error',
+                message: 'Runner returned a replacement session id; the replacement was stopped and the original session was preserved',
+                code: 'resume_failed'
+            })
             expect(configRpcCalls).toBe(0)
-            expect(mergeCalls).toBe(1)
-            expect(engine.getSession(spawnedSessionId)?.permissionMode).toBe('yolo')
-            expect(store.sessions.getSession(oldSession.id)).toBeNull()
+            expect(mergeCalls).toBe(0)
+            expect(store.sessions.getSession(oldSession.id)).not.toBeNull()
+            expect(store.messages.getMessages(oldSession.id)).toHaveLength(1)
+            expect(store.sessions.getSession(spawnedSessionId)).toBeNull()
         } finally {
             engine.stop()
+        }
+    })
+
+    it.each([
+        ['codex', 'codexSessionId', 'codex-thread-restart', 'gpt-5.6-sol', undefined, 'high'],
+        ['claude', 'claudeSessionId', 'claude-thread-restart', 'sonnet', 'high', undefined]
+    ] as const)('reactivates the original %s HAPI id after a Hub restart', async (
+        flavor,
+        nativeIdField,
+        nativeId,
+        model,
+        effort,
+        modelReasoningEffort
+    ) => {
+        const store = new Store(':memory:')
+        const firstEngine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+        const original = firstEngine.getOrCreateSession(
+            `stable-${flavor}-before-hub-restart`,
+            {
+                path: '/tmp/project',
+                host: 'localhost',
+                machineId: 'machine-1',
+                flavor,
+                [nativeIdField]: nativeId
+            },
+            null,
+            'default',
+            model,
+            effort,
+            modelReasoningEffort
+        )
+        store.messages.addMessage(original.id, {
+            role: 'user',
+            content: { type: 'text', text: 'history survives the Hub restart' }
+        })
+        firstEngine.handleSessionAlive({
+            sid: original.id,
+            time: Date.now(),
+            permissionMode: 'yolo'
+        })
+        firstEngine.handleSessionEnd({ sid: original.id, time: Date.now() })
+        firstEngine.stop()
+
+        const restartedEngine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+        try {
+            restartedEngine.getOrCreateMachine(
+                'machine-1',
+                { host: 'localhost', platform: 'linux', happyCliVersion: '0.29.0' },
+                null,
+                'default'
+            )
+            restartedEngine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+
+            let capturedArgs: unknown[] = []
+            ;(restartedEngine as any).rpcGateway.spawnSession = async (...args: unknown[]) => {
+                capturedArgs = args
+                restartedEngine.handleSessionAlive({ sid: original.id, time: Date.now() })
+                return { type: 'success', sessionId: original.id }
+            }
+
+            const result = await restartedEngine.resumeSession(original.id, 'default')
+
+            expect(result).toEqual({ type: 'success', sessionId: original.id })
+            expect(capturedArgs[8]).toBe(nativeId)
+            expect(capturedArgs[12]).toBe(original.id)
+            expect(restartedEngine.getSessionsByNamespace('default').map((session) => session.id)).toEqual([
+                original.id
+            ])
+            expect(store.messages.getMessages(original.id)).toHaveLength(1)
+            expect(restartedEngine.getSession(original.id)).toMatchObject({
+                active: true,
+                model,
+                effort: effort ?? null,
+                modelReasoningEffort: modelReasoningEffort ?? null,
+                permissionMode: 'yolo'
+            })
+            expect(restartedEngine.getSession(original.id)?.metadata?.stableIdentityResumeAttempt).toBeUndefined()
+        } finally {
+            restartedEngine.stop()
+        }
+    })
+
+    it('quarantines an unexpected Codex replacement until its runner actually exits', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+
+        try {
+            const original = engine.getOrCreateSession('stable-codex-quarantine', {
+                path: '/tmp/project',
+                host: 'localhost',
+                machineId: 'machine-1',
+                flavor: 'codex',
+                codexSessionId: 'codex-thread-quarantine'
+            }, null, 'default')
+            engine.getOrCreateMachine(
+                'machine-1',
+                { host: 'localhost', platform: 'linux', happyCliVersion: '0.29.0' },
+                null,
+                'default'
+            )
+            engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+
+            let childSessionId = ''
+            ;(engine as any).rpcGateway.spawnSession = async () => {
+                const child = engine.getOrCreateSession('unstable-codex-replacement', {
+                    path: '/tmp/project',
+                    host: 'localhost',
+                    machineId: 'machine-1',
+                    flavor: 'codex',
+                    codexSessionId: 'codex-thread-quarantine'
+                }, null, 'default')
+                childSessionId = child.id
+                engine.handleSessionAlive({ sid: child.id, time: Date.now() })
+                return { type: 'success', sessionId: child.id }
+            }
+            ;(engine as any).rpcGateway.stopRunnerSession = async () => 'still_alive'
+
+            expect(await engine.resumeSession(original.id, 'default')).toEqual({
+                type: 'error',
+                message: 'Runner returned a replacement session id and its process could not be confirmed stopped',
+                code: 'resume_failed',
+                rollbackSafe: false
+            })
+            expect(store.sessions.getSession(original.id)).not.toBeNull()
+            expect(store.sessions.getSession(childSessionId)?.active).toBe(false)
+            expect(engine.getSession(childSessionId)?.active).toBe(true)
+            expect(engine.getSession(original.id)?.metadata?.stableIdentityResumeAttempt).toMatchObject({
+                state: 'quarantined',
+                machineId: 'machine-1',
+                childSessionId
+            })
+
+            engine.handleSessionEnd({ sid: childSessionId, time: Date.now(), reason: 'error' })
+            await new Promise((resolve) => setTimeout(resolve, 0))
+
+            expect(store.sessions.getSession(original.id)).not.toBeNull()
+            expect(store.sessions.getSession(childSessionId)).toBeNull()
+        } finally {
+            engine.stop()
+        }
+    })
+
+    it.each([
+        ['codex', 'codexSessionId', 'codex-thread-mid-restart'],
+        ['claude', 'claudeSessionId', 'claude-thread-mid-restart']
+    ] as const)('keeps the original %s row through a Hub restart during reactivation', async (
+        flavor,
+        nativeIdField,
+        nativeId
+    ) => {
+        const store = new Store(':memory:')
+        const firstEngine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+        const original = firstEngine.getOrCreateSession('stable-original-mid-restart', {
+            path: '/tmp/project',
+            host: 'localhost',
+            machineId: 'machine-1',
+            flavor,
+            [nativeIdField]: nativeId,
+            stableIdentityResumeAttempt: {
+                state: 'resuming',
+                machineId: 'machine-1',
+                startedAt: 1
+            }
+        }, null, 'default')
+        store.messages.addMessage(original.id, {
+            role: 'user',
+            content: { type: 'text', text: 'durable original history' }
+        })
+        const replacement = firstEngine.getOrCreateSession('replacement-mid-restart', {
+            path: '/tmp/project',
+            host: 'localhost',
+            machineId: 'machine-1',
+            flavor,
+            [nativeIdField]: nativeId
+        }, null, 'default')
+        firstEngine.stop()
+
+        const restartedEngine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+        try {
+            restartedEngine.getOrCreateMachine(
+                'machine-1',
+                { host: 'localhost', platform: 'linux', happyCliVersion: '0.29.0' },
+                null,
+                'default'
+            )
+            restartedEngine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+            restartedEngine.handleSessionAlive({ sid: replacement.id, time: Date.now() })
+            await new Promise((resolve) => setTimeout(resolve, 0))
+
+            expect(store.sessions.getSession(original.id)).not.toBeNull()
+            expect(store.messages.getMessages(original.id)).toHaveLength(1)
+
+            let stoppedSessionId = ''
+            ;(restartedEngine as any).rpcGateway.stopRunnerSession = async (
+                _machineId: string,
+                sessionId: string
+            ) => {
+                stoppedSessionId = sessionId
+                return 'stopped'
+            }
+            ;(restartedEngine as any).rpcGateway.spawnSession = async () => {
+                restartedEngine.handleSessionAlive({ sid: original.id, time: Date.now() })
+                return { type: 'success', sessionId: original.id }
+            }
+
+            expect(await restartedEngine.resumeSession(original.id, 'default')).toEqual({
+                type: 'success',
+                sessionId: original.id
+            })
+            expect(stoppedSessionId).toBe(original.id)
+            expect(store.sessions.getSession(original.id)).not.toBeNull()
+            expect(store.sessions.getSession(replacement.id)).toBeNull()
+            expect(store.messages.getMessages(original.id)).toHaveLength(1)
+            expect(restartedEngine.getSessionsByNamespace('default').map((session) => session.id)).toEqual([
+                original.id
+            ])
+            expect(restartedEngine.getSession(original.id)?.metadata?.stableIdentityResumeAttempt).toBeUndefined()
+        } finally {
+            restartedEngine.stop()
         }
     })
 
