@@ -16,7 +16,7 @@ function createPublisher(events: SyncEvent[]): EventPublisher {
 }
 
 describe('alive incremental events', () => {
-    it('replays durable immediate prompts on every attach until consumed', () => {
+    it('dispatches a durable immediate prompt once across repeated attaches', () => {
         const store = new Store(':memory:')
         const emitted: Array<{ body?: { t?: string; message?: { localId?: string | null } } }> = []
         const io = {
@@ -36,13 +36,13 @@ describe('alive incremental events', () => {
             engine.handleSessionAlive({ sid: session.id, time: Date.now() })
             engine.handleSessionAlive({ sid: session.id, time: Date.now() + 1 })
             expect(emitted.map((update) => update.body?.message?.localId)).toEqual([
-                'queued-before-attach', 'queued-before-attach'
+                'queued-before-attach'
             ])
 
             store.messages.markMessagesInvoked(session.id, ['queued-before-attach'], Date.now())
             engine.handleSessionAlive({ sid: session.id, time: Date.now() + 2 })
             expect(emitted.map((update) => update.body?.message?.localId)).toEqual([
-                'queued-before-attach', 'queued-before-attach'
+                'queued-before-attach'
             ])
         } finally { engine.stop() }
     })
