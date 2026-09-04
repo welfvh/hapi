@@ -870,6 +870,24 @@ export function setMessagesDeliveryState(
     ).run(state, sessionId, ...localIds).changes
 }
 
+/** Claim queued local messages before emitting them to a CLI socket. */
+export function claimMessagesForDispatch(
+    db: Database,
+    sessionId: string,
+    localIds: string[]
+): number {
+    if (localIds.length === 0) return 0
+    const placeholders = localIds.map(() => '?').join(', ')
+    return db.prepare(
+        `UPDATE messages
+         SET delivery_state = 'dispatching'
+         WHERE session_id = ?
+           AND local_id IN (${placeholders})
+           AND invoked_at IS NULL
+           AND delivery_state = 'queued'`
+    ).run(sessionId, ...localIds).changes
+}
+
 /** Hold an ambiguous steer out of automatic replay without claiming delivery. */
 export function markMessagesIndeterminate(
     db: Database,

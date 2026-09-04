@@ -840,7 +840,7 @@ export class MessageService {
         // request can arrive after the first response was lost or after this
         // hub restarts. It must acknowledge the existing row without sending
         // the prompt to the CLI a second time.
-        const shouldEmitToCli = inserted.inserted && msg.deliveryState !== 'indeterminate'
+        let shouldEmitToCli = inserted.inserted && msg.deliveryState !== 'indeterminate'
         this.onSessionActivity?.(actualSessionId, msg.createdAt)
 
         // Only emit to CLI if the message is not scheduled for the future.
@@ -850,7 +850,11 @@ export class MessageService {
         // the pre-insert `now` capture could misclassify a borderline scheduledAt
         // as future when it has already become past by the time we check.
         const isFutureScheduled = msg.scheduledAt !== null && msg.scheduledAt > Date.now()
-        if (shouldEmitToCli && !isFutureScheduled && !this.store.isOpenCodeClearDeliveryGated(actualSessionId)) {
+        const deliveryGated = this.store.isOpenCodeClearDeliveryGated(actualSessionId)
+        if (shouldEmitToCli && !isFutureScheduled && !deliveryGated && msg.localId) {
+            shouldEmitToCli = this.store.messages.claimMessagesForDispatch(actualSessionId, [msg.localId]) === 1
+        }
+        if (shouldEmitToCli && !isFutureScheduled && !deliveryGated) {
             const update = {
                 id: msg.id,
                 seq: msg.seq,
@@ -924,6 +928,7 @@ export class MessageService {
         if (this.store.isOpenCodeClearDeliveryGated(sessionId)) return 0
         const queued = this.store.messages.getImmediateQueuedLocalMessages(sessionId)
         for (const msg of queued) {
+            if (!msg.localId || this.store.messages.claimMessagesForDispatch(sessionId, [msg.localId]) !== 1) continue
             const update = {
                 id: msg.id,
                 seq: msg.seq,
@@ -951,6 +956,7 @@ export class MessageService {
         const queued = this.store.messages.getUninvokedLocalMessages(sessionId, { deliverableOnly: true })
             .filter((msg) => msg.scheduledAt === null || msg.scheduledAt <= now)
         for (const msg of queued) {
+            if (!msg.localId || this.store.messages.claimMessagesForDispatch(sessionId, [msg.localId]) !== 1) continue
             const update = {
                 id: msg.id,
                 seq: msg.seq,
@@ -976,9 +982,8 @@ export class MessageService {
      *
      * Finds all scheduled messages whose scheduled_at <= now and emits them to
      * the CLI via socket.io.  Does NOT call markMessagesInvoked — the CLI ack
-     * (messages-consumed) handles that.  This means a message is re-emitted on
-     * each tick until the CLI acks it, which is the correct behaviour for hub
-     * restart scenarios (pitfall #2 guard).
+     * (messages-consumed) handles that. The durable dispatch claim prevents a
+     * hub or runner restart from invoking the same prompt again before its ACK.
      *
      * Race window with cancel: this tick widens the cancel race to 5 s for
      * scheduled messages (vs near-zero for immediate-queued ones). If the CLI
@@ -998,8 +1003,15 @@ export class MessageService {
             if (skipSessionIds?.has(msg.sessionId) || deliveryGated) {
                 continue
             }
+            const cliNamespace = this.io.of('/cli')
+            const roomName = `session:${msg.sessionId}`
+            if ((cliNamespace.adapter.rooms.get(roomName)?.size ?? 0) !== 1) continue
             const localId = msg.localId
-            if (typeof localId === 'string' && !this.scheduledMatureNotifiedLocalIds.has(localId)) {
+            if (typeof localId !== 'string'
+                || this.store.messages.claimMessagesForDispatch(msg.sessionId, [localId]) !== 1) {
+                continue
+            }
+            if (!this.scheduledMatureNotifiedLocalIds.has(localId)) {
                 this.scheduledMatureNotifiedLocalIds.add(localId)
                 maturedSessionIds.add(msg.sessionId)
             }
@@ -1019,9 +1031,8 @@ export class MessageService {
                     }
                 }
             }
-            this.io.of('/cli').to(`session:${msg.sessionId}`).emit('update', update)
-            // NOTE: do NOT call markMessagesInvoked here (pitfall #2).
-            // CLI ack (messages-consumed) will handle invoked_at stamping.
+            cliNamespace.to(roomName).emit('update', update)
+            // The CLI ACK owns the final invoked_at stamp.
         }
         for (const sessionId of maturedSessionIds) {
             this.publisher.emit({ type: 'scheduled-matured', sessionId })

@@ -7,6 +7,7 @@ import {
     cancelQueuedMessage,
     deleteQueuedMessageById,
     claimIndeterminateMessage,
+    claimMessagesForDispatch,
     lookupQueuedMessage,
     getMessages,
     getFirstMessages,
@@ -168,6 +169,10 @@ export class MessageStore {
 
     claimIndeterminateMessage(sessionId: string, messageId: string): StoredMessage | null {
         return claimIndeterminateMessage(this.db, sessionId, messageId)
+    }
+
+    claimMessagesForDispatch(sessionId: string, localIds: string[]): number {
+        return claimMessagesForDispatch(this.db, sessionId, localIds)
     }
 
     markMessagesInvoked(sessionId: string, localIds: string[], invokedAt: number): number {
