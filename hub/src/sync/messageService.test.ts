@@ -1233,7 +1233,7 @@ describe('MessageService.sendMessage deliveryMode', () => {
         })
     })
 
-    it('delivers a duplicate-localId retry as queue even when the stored row retains steer', async () => {
+    it('does not dispatch a duplicate localId after the hub service restarts', async () => {
         const store = makeStore()
         const session = store.sessions.getOrCreateSession(
             'delivery-mode-duplicate-pi',
@@ -1249,18 +1249,18 @@ describe('MessageService.sendMessage deliveryMode', () => {
             localId: 'duplicate-steer',
             deliveryMode: 'steer'
         })
-        await service.sendMessage(session.id, {
+        // A fresh service proves that the idempotency claim lives in SQLite,
+        // not an in-memory set that disappears with the hub process.
+        const restartedService = new MessageService(store, io, makePublisher() as any)
+        await restartedService.sendMessage(session.id, {
             text: 'retry requests queue',
             localId: 'duplicate-steer',
             deliveryMode: 'queue'
         })
 
-        expect(cliEmitted).toHaveLength(2)
+        expect(cliEmitted).toHaveLength(1)
         expect(cliEmitted[0]).toMatchObject({
             body: { message: { content: { meta: { deliveryMode: 'steer' } } } }
-        })
-        expect(cliEmitted[1]).toMatchObject({
-            body: { message: { content: { meta: { deliveryMode: 'queue' } } } }
         })
         const rows = store.messages.getUninvokedLocalMessages(session.id)
         expect(rows).toHaveLength(1)

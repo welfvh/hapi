@@ -836,7 +836,11 @@ export class MessageService {
         const cliContent = inserted.inserted
             ? msg.content
             : contentForDeferredDelivery(msg.content)
-        const shouldEmitToCli = msg.deliveryState !== 'indeterminate'
+        // The SQLite localId row is the durable dispatch claim. A repeated
+        // request can arrive after the first response was lost or after this
+        // hub restarts. It must acknowledge the existing row without sending
+        // the prompt to the CLI a second time.
+        const shouldEmitToCli = inserted.inserted && msg.deliveryState !== 'indeterminate'
         this.onSessionActivity?.(actualSessionId, msg.createdAt)
 
         // Only emit to CLI if the message is not scheduled for the future.
