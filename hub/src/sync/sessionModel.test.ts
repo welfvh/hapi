@@ -2275,6 +2275,190 @@ describe('session model', () => {
         }
     })
 
+    it.each([
+        ['codex', 'codexSessionId', 'codex-thread-concurrent-resume'],
+        ['claude', 'claudeSessionId', 'claude-thread-concurrent-resume']
+    ] as const)('coalesces concurrent %s resume requests onto one runner spawn', async (
+        flavor,
+        nativeIdField,
+        nativeId
+    ) => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+
+        try {
+            const session = engine.getOrCreateSession('stable-concurrent-resume', {
+                path: '/tmp/project',
+                host: 'localhost',
+                machineId: 'machine-1',
+                flavor,
+                [nativeIdField]: nativeId
+            }, null, 'default')
+            engine.getOrCreateMachine(
+                'machine-1',
+                { host: 'localhost', platform: 'linux', happyCliVersion: '0.29.0' },
+                null,
+                'default'
+            )
+            engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+
+            let releaseSpawn!: () => void
+            const spawnGate = new Promise<void>((resolve) => { releaseSpawn = resolve })
+            let spawnCalls = 0
+            ;(engine as any).rpcGateway.spawnSession = async () => {
+                spawnCalls += 1
+                await spawnGate
+                engine.handleSessionAlive({ sid: session.id, time: Date.now() })
+                return { type: 'success', sessionId: session.id }
+            }
+
+            const first = engine.resumeSession(session.id, 'default')
+            for (let i = 0; i < 20 && spawnCalls === 0; i += 1) await flushAsyncWork()
+            const second = engine.resumeSession(session.id, 'default')
+            await flushAsyncWork()
+
+            expect(spawnCalls).toBe(1)
+            releaseSpawn()
+            expect(await Promise.all([first, second])).toEqual([
+                { type: 'success', sessionId: session.id },
+                { type: 'success', sessionId: session.id }
+            ])
+            expect(spawnCalls).toBe(1)
+            expect(engine.getSession(session.id)?.metadata?.stableIdentityResumeAttempt).toBeUndefined()
+        } finally {
+            engine.stop()
+        }
+    })
+
+    it('coalesces an archived Claude reopen with a concurrent resume', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+
+        try {
+            const session = engine.getOrCreateSession('stable-concurrent-reopen-resume', {
+                path: '/tmp/project',
+                host: 'localhost',
+                machineId: 'machine-1',
+                flavor: 'claude',
+                claudeSessionId: 'claude-thread-concurrent-reopen-resume',
+                lifecycleState: 'archived',
+                archivedBy: 'hub',
+                archiveReason: 'inactivity'
+            }, null, 'default')
+            store.messages.addMessage(session.id, {
+                role: 'user',
+                content: { type: 'text', text: 'keep this archived transcript' }
+            })
+            engine.getOrCreateMachine(
+                'machine-1',
+                { host: 'localhost', platform: 'linux', happyCliVersion: '0.29.0' },
+                null,
+                'default'
+            )
+            engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+
+            let releaseSpawn!: () => void
+            const spawnGate = new Promise<void>((resolve) => { releaseSpawn = resolve })
+            let spawnCalls = 0
+            ;(engine as any).rpcGateway.spawnSession = async () => {
+                spawnCalls += 1
+                await spawnGate
+                engine.handleSessionAlive({ sid: session.id, time: Date.now() })
+                return { type: 'success', sessionId: session.id }
+            }
+
+            const reopen = engine.reopenSession(session.id, 'default')
+            for (let i = 0; i < 20 && spawnCalls === 0; i += 1) await flushAsyncWork()
+            const resume = engine.resumeSession(session.id, 'default')
+            await flushAsyncWork()
+
+            expect(spawnCalls).toBe(1)
+            releaseSpawn()
+            const [reopenResult, resumeResult] = await Promise.all([reopen, resume])
+            expect(reopenResult).toEqual({ type: 'success', sessionId: session.id, resumed: true })
+            expect(resumeResult).toEqual({ type: 'success', sessionId: session.id })
+            expect(spawnCalls).toBe(1)
+            expect(store.messages.getMessages(session.id)).toHaveLength(1)
+        } finally {
+            engine.stop()
+        }
+    })
+
+    it('coalesces concurrent retries while reconciling a persisted Codex reactivation marker', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+
+        try {
+            const session = engine.getOrCreateSession('stable-concurrent-restart-retry', {
+                path: '/tmp/project',
+                host: 'localhost',
+                machineId: 'machine-1',
+                flavor: 'codex',
+                codexSessionId: 'codex-thread-concurrent-restart-retry',
+                stableIdentityResumeAttempt: {
+                    state: 'resuming',
+                    machineId: 'machine-1',
+                    startedAt: 1
+                }
+            }, null, 'default')
+            engine.getOrCreateMachine(
+                'machine-1',
+                { host: 'localhost', platform: 'linux', happyCliVersion: '0.29.0' },
+                null,
+                'default'
+            )
+            engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+
+            let releaseSpawn!: () => void
+            const spawnGate = new Promise<void>((resolve) => { releaseSpawn = resolve })
+            let spawnCalls = 0
+            let stopCalls = 0
+            ;(engine as any).rpcGateway.stopRunnerSession = async () => {
+                stopCalls += 1
+                return 'stopped'
+            }
+            ;(engine as any).rpcGateway.spawnSession = async () => {
+                spawnCalls += 1
+                await spawnGate
+                engine.handleSessionAlive({ sid: session.id, time: Date.now() })
+                return { type: 'success', sessionId: session.id }
+            }
+
+            const first = engine.resumeSession(session.id, 'default')
+            for (let i = 0; i < 20 && spawnCalls === 0; i += 1) await flushAsyncWork()
+            const second = engine.resumeSession(session.id, 'default')
+            await flushAsyncWork()
+
+            expect(stopCalls).toBe(1)
+            expect(spawnCalls).toBe(1)
+            releaseSpawn()
+            expect(await Promise.all([first, second])).toEqual([
+                { type: 'success', sessionId: session.id },
+                { type: 'success', sessionId: session.id }
+            ])
+            expect(stopCalls).toBe(1)
+            expect(spawnCalls).toBe(1)
+            expect(engine.getSession(session.id)?.metadata?.stableIdentityResumeAttempt).toBeUndefined()
+        } finally {
+            engine.stop()
+        }
+    })
+
     it('quarantines an unexpected Codex replacement until its runner actually exits', async () => {
         const store = new Store(':memory:')
         const engine = new SyncEngine(

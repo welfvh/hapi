@@ -193,6 +193,8 @@ export class SyncEngine {
     private readonly piUnexpectedTempOriginalIds = new Map<string, string>()
     /** Codex/Claude rows whose runner spawn must reattach to the same durable HAPI id. */
     private readonly stableIdentityResumeInFlightCounts = new Map<string, number>()
+    /** Coalesce concurrent Codex/Claude reactivation requests for the same durable row. */
+    private readonly stableIdentityResumePromises = new Map<string, Promise<ResumeSessionResult>>()
     /** Serialize scratchlist uploads per session so disk-byte caps cannot race. */
     private readonly scratchlistUploadTails = new Map<string, Promise<unknown>>()
     /** Coalesce duplicate clear requests so retries cannot spawn two fresh sessions. */
@@ -2819,6 +2821,39 @@ export class SyncEngine {
     }
 
     async resumeSession(sessionId: string, namespace: string, opts?: { permissionMode?: PermissionMode }): Promise<ResumeSessionResult> {
+        const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
+        if (!access.ok) {
+            return {
+                type: 'error',
+                message: access.reason === 'access-denied' ? 'Session access denied' : 'Session not found',
+                code: access.reason === 'access-denied' ? 'access_denied' : 'session_not_found'
+            }
+        }
+
+        const flavor = this.resolveFlavor(access.session)
+        if (flavor !== 'codex' && flavor !== 'claude') {
+            return this.resumeSessionOnce(access.sessionId, namespace, opts)
+        }
+
+        const key = JSON.stringify([access.session.namespace, access.sessionId])
+        const existing = this.stableIdentityResumePromises.get(key)
+        if (existing) return existing
+
+        const inFlight = this.resumeSessionOnce(access.sessionId, namespace, opts)
+            .finally(() => {
+                if (this.stableIdentityResumePromises.get(key) === inFlight) {
+                    this.stableIdentityResumePromises.delete(key)
+                }
+            })
+        this.stableIdentityResumePromises.set(key, inFlight)
+        return inFlight
+    }
+
+    private async resumeSessionOnce(
+        sessionId: string,
+        namespace: string,
+        opts?: { permissionMode?: PermissionMode }
+    ): Promise<ResumeSessionResult> {
         const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
         if (!access.ok) {
             return {
