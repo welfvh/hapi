@@ -516,7 +516,7 @@ export class MessageService {
             if (ackResult === 'consumed') {
                 return this.recordConsumedAcknowledgement(sessionId, localId)
             }
-            if (ackResult === 'in-flight' || ackResult === 'indeterminate' || (ackResult === 'timeout' && cliCount > 0)) {
+            if (ackResult === 'in-flight' || ackResult === 'indeterminate' || ackResult === 'unavailable' || (ackResult === 'timeout' && cliCount > 0)) {
                 return { status: 'busy', localId }
             }
             this.store.messages.deleteQueuedMessageById(sessionId, resolvedId)
@@ -601,7 +601,7 @@ export class MessageService {
         if (ackResult === 'consumed') {
             return this.recordConsumedAcknowledgement(sessionId, localId)
         }
-        if (ackResult === 'in-flight' || ackResult === 'indeterminate') {
+        if (ackResult === 'in-flight' || ackResult === 'indeterminate' || ackResult === 'unavailable') {
             // The row is inside an async steer (mid-turn delivery): it can
             // neither be removed nor stamped invoked — the steer's eventual
             // accept/reject decides. Report busy so the caller keeps the row.
@@ -658,10 +658,19 @@ export class MessageService {
         }
         this.activeIndeterminateRetries.add(retryKey)
 
-        try {
         const roomName = `session:${sessionId}`
-        const cliCount = this.io.of('/cli').adapter.rooms.get(roomName)?.size ?? 0
-        if (this.store.isOpenCodeClearDeliveryGated(sessionId) || cliCount !== 1) {
+        const namespace = this.io.of('/cli')
+        const adapter = namespace.adapter
+        const owners = adapter.rooms.get(roomName)
+        const ownerId = owners?.size === 1 ? owners.values().next().value : undefined
+        let ownershipChanged = false
+        const membershipChanged = (changedRoom: string) => {
+            if (changedRoom === roomName) ownershipChanged = true
+        }
+        adapter.on('join-room', membershipChanged)
+        adapter.on('leave-room', membershipChanged)
+        try {
+        if (this.store.isOpenCodeClearDeliveryGated(sessionId) || !ownerId) {
             return { status: 'retry-unavailable', localId: lookup.localId }
         }
 
@@ -672,7 +681,10 @@ export class MessageService {
                 ? { status: 'invoked', message: toDecryptedMessage(settled.message) }
                 : { status: 'not-found' }
         }
-        if (cancelResult === 'in-flight' || cancelResult === 'timeout') {
+        const currentOwners = adapter.rooms.get(roomName)
+        if (cancelResult === 'in-flight' || cancelResult === 'timeout' || cancelResult === 'unavailable'
+            || ownershipChanged || currentOwners?.size !== 1 || !currentOwners.has(ownerId)
+            || this.store.isOpenCodeClearDeliveryGated(sessionId)) {
             return { status: 'retry-unavailable', localId: lookup.localId }
         }
         const refreshed = this.store.messages.lookupQueuedMessage(sessionId, messageId)
@@ -706,7 +718,7 @@ export class MessageService {
                 }
             }
         }
-        const room = this.io.of('/cli').to(roomName)
+        const room = namespace.to(ownerId)
         const accepted = await new Promise<boolean>((resolve) => {
             room.timeout(500).emit(
                 'update',
@@ -727,6 +739,8 @@ export class MessageService {
         this.publisher.emit({ type: 'messages-requeued', sessionId, localIds: [message.localId] })
         return { status: 'retried', localId: message.localId }
         } finally {
+            adapter.off('join-room', membershipChanged)
+            adapter.off('leave-room', membershipChanged)
             this.activeIndeterminateRetries.delete(retryKey)
         }
     }
@@ -744,7 +758,7 @@ export class MessageService {
         localId: string,
         messageId: string,
         timeoutMs: number
-    ): Promise<'removed' | 'in-flight' | 'indeterminate' | 'consumed' | 'not-found' | 'timeout'> {
+    ): Promise<'removed' | 'in-flight' | 'indeterminate' | 'consumed' | 'not-found' | 'timeout' | 'unavailable'> {
         return new Promise((resolve) => {
             const namespace = this.io.of('/cli')
             const roomName = `session:${sessionId}`
@@ -752,7 +766,7 @@ export class MessageService {
             const owners = adapter.rooms.get(roomName)
             const ownerId = owners?.size === 1 ? owners.values().next().value : undefined
             if (!ownerId) {
-                resolve('indeterminate')
+                resolve('unavailable')
                 return
             }
             let ownershipChanged = false
@@ -761,7 +775,7 @@ export class MessageService {
             }
             adapter.on('join-room', membershipChanged)
             adapter.on('leave-room', membershipChanged)
-            const finish = (result: 'removed' | 'in-flight' | 'indeterminate' | 'consumed' | 'not-found' | 'timeout') => {
+            const finish = (result: 'removed' | 'in-flight' | 'indeterminate' | 'consumed' | 'not-found' | 'timeout' | 'unavailable') => {
                 adapter.off('join-room', membershipChanged)
                 adapter.off('leave-room', membershipChanged)
                 resolve(result)
@@ -785,7 +799,7 @@ export class MessageService {
                 (err: Error | null, responses: Array<{ removed: boolean; inFlight?: boolean; indeterminate?: boolean; consumed?: boolean }>) => {
                     const currentOwners = adapter.rooms.get(roomName)
                     if (ownershipChanged || currentOwners?.size !== 1 || !currentOwners.has(ownerId)) {
-                        finish('indeterminate')
+                        finish('unavailable')
                         return
                     }
                     if (err || responses?.length !== 1) {
@@ -811,7 +825,7 @@ export class MessageService {
                     }
                     finish('not-found')
                 }
-            ) } catch { finish('indeterminate') }
+            ) } catch { finish('unavailable') }
         })
     }
 

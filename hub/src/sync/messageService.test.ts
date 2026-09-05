@@ -98,6 +98,66 @@ function makePublisher() {
     }
 }
 
+describe('retry cancellation ownership', () => {
+    for (const scenario of ['disconnect', 'replacement', 'overlap', 'post-ack-overlap', 'partial-timeout', 'emit-throws', 'two-owners', 'explicit-unknown', 'removed', 'not-found'] as const) {
+        for (const deliveryState of ['dispatching', 'indeterminate'] as const) {
+            it(`${deliveryState}: ${scenario} preserves ownership before any retry emit`, async () => {
+                const store = makeStore()
+                try {
+                    const session = makeSession(store, `retry-${scenario}-${deliveryState}`)
+                    const message = store.messages.addMessage(session.id, 'held text', 'held-local')
+                    store.messages.setMessagesDeliveryState(session.id, ['held-local'], deliveryState)
+                    const before = store.messages.getUninvokedLocalMessages(session.id)
+                    const roomName = `session:${session.id}`
+                    const owners = new Set(scenario === 'two-owners' ? ['owner-a', 'owner-b'] : ['owner-a'])
+                    const adapter = Object.assign(new EventEmitter(), { rooms: new Map([[roomName, owners]]) })
+                    const updates: string[] = []
+                    const targets: string[] = []
+                    const overlap = () => {
+                        owners.add('owner-b')
+                        adapter.emit('join-room', roomName, 'owner-b')
+                        owners.delete('owner-b')
+                        adapter.emit('leave-room', roomName, 'owner-b')
+                    }
+                    const io = { of: () => ({ adapter, to: (target: string) => {
+                        targets.push(target)
+                        return { timeout: () => ({ emit: (_event: string, update: { body: { t: string } }, ack: (error: Error | null, responses: object[]) => void) => {
+                            updates.push(update.body.t)
+                            if (update.body.t === 'retry-queued-message') {
+                                ack(null, [{ accepted: true }])
+                                return
+                            }
+                            if (scenario === 'emit-throws') throw new Error('transport unavailable')
+                            if (scenario === 'disconnect' || scenario === 'replacement') {
+                                owners.delete('owner-a')
+                                adapter.emit('leave-room', roomName, 'owner-a')
+                                if (scenario === 'replacement') owners.add('owner-b')
+                            }
+                            if (scenario === 'overlap') overlap()
+                            ack(scenario === 'partial-timeout' ? new Error('partial timeout') : null, [{
+                                removed: scenario !== 'explicit-unknown' && scenario !== 'not-found',
+                                indeterminate: scenario === 'explicit-unknown'
+                            }])
+                            if (scenario === 'post-ack-overlap') overlap()
+                        } }) }
+                    } }) } as unknown as Server
+                    const publisher = makePublisher()
+                    const result = await new MessageService(store, io, publisher as any).retryIndeterminateMessage(session.id, message.id)
+                    const allowed = scenario === 'explicit-unknown' || scenario === 'removed' || scenario === 'not-found'
+                    expect(result).toEqual({ status: allowed ? 'retried' : 'retry-unavailable', localId: 'held-local' })
+                    expect(updates.filter(update => update === 'retry-queued-message')).toHaveLength(allowed ? 1 : 0)
+                    expect(targets.every(target => target === 'owner-a')).toBe(true)
+                    if (!allowed) {
+                        expect(store.messages.getUninvokedLocalMessages(session.id)).toEqual(before)
+                        expect(publisher.events).toEqual([])
+                    }
+                    expect(adapter.listenerCount('join-room') + adapter.listenerCount('leave-room')).toBe(0)
+                } finally { store.close() }
+            })
+        }
+    }
+})
+
 describe('dispatch-claimed queue cancellation', () => {
     for (const scenario of ['two-owner-disconnect-partial', 'sole-owner-disconnect-partial', 'owner-replaced', 'membership-flap', 'partial-timeout'] as const) {
         it(`retains dispatch-claimed IDs for ${scenario}`, async () => {

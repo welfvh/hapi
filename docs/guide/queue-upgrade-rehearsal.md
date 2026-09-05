@@ -52,6 +52,20 @@ error-free response from unchanged membership, and recheck the captured ID befor
 dispatch-claimed deletion. Partial ACK plus timeout never proves removal. Tests
 cover two owners shrinking to one, disconnection, replacement and transient overlap.
 
+Retry caller correction: transport/ownership failure returns `unavailable`, distinct
+from an unchanged wrapper's explicit native `indeterminate` response. All four
+cancel-ACK call sites fail closed on `unavailable`. Retry retains the identified
+sole owner and membership listener through its await, rechecks the delivery gate,
+and addresses only that socket rather than broadcasting to replacement owners.
+Regression tests assert no retry emit, no durable-row mutation and no publication
+for disconnection, replacement, overlap (including after ACK), partial timeout,
+transport throw and initial multiple ownership, for both held delivery states.
+Positive removed/not-found/explicit-native-unknown resolutions remain retryable.
+
+Desktop reference documentation confirms distinct steer-current and wait-next
+preferences only; it does not establish a default, layout, modifier or reorder
+parity. This correction neither changes that limitation nor introduces steering.
+
 The native fixture rejects all undeclared methods (including steer/interrupt),
 with negative tests using its actual child process. Rehearsal asserts no steer or
 interrupt anywhere in its native log and exact equality of the complete replacement
