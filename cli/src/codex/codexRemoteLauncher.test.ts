@@ -1250,7 +1250,7 @@ function createSessionStub(
 
 describe('codexRemoteLauncher', () => {
     it.each(['active-empty-wait', 'immediate-loop'])(
-        'automatically steers live followups arriving at %s without abort or another turn/start',
+        'dispatches explicit steer arriving at %s without abort or another turn/start',
         async (arrival) => {
             harness.suppressTurnCompletion = true;
             const { session, emitMessagesConsumed } = createSessionStub(['first'], createMode(), false, false);
@@ -1271,6 +1271,36 @@ describe('codexRemoteLauncher', () => {
             expect(harness.startTurnThreadIds).toHaveLength(1);
             expect(harness.interruptedTurns).toHaveLength(0);
             session.queue.close();
+        }
+    );
+
+    it.each(['active-empty-wait', 'immediate-loop'])(
+        'keeps intentional queue input arriving at %s until turn completion',
+        async (arrival) => {
+            harness.suppressTurnCompletion = true;
+            const { session, emitMessagesConsumed } = createSessionStub(['first'], createMode(), false, false);
+            let enqueued = false;
+            const enqueue = () => {
+                if (enqueued) return;
+                enqueued = true;
+                session.queue.push('next turn', { ...createMode(), deliveryMode: 'queue' }, 'queued-human');
+            };
+            if (arrival === 'immediate-loop') harness.onStartTurn = enqueue;
+            const run = codexRemoteLauncher(session as never);
+            await vi.waitFor(() => expect(harness.startTurnThreadIds).toHaveLength(1));
+            if (arrival === 'active-empty-wait') enqueue();
+            await new Promise((resolve) => setTimeout(resolve, 40));
+            expect(harness.steerTurnParams).toHaveLength(0);
+            expect(harness.startTurnThreadIds).toHaveLength(1);
+            expect(session.queue.queue[0]?.localId).toBe('queued-human');
+            expect(emitMessagesConsumed).not.toHaveBeenCalled();
+            harness.suppressTurnCompletion = false;
+            session.queue.close();
+            harness.dispatchNotification?.('turn/completed', { threadId: 'thread-1', turn: { id: 'turn-1' } });
+            await run;
+            expect(harness.startTurnMessages).toEqual(['first', 'next turn']);
+            expect(harness.steerTurnParams).toHaveLength(0);
+            expect(harness.interruptedTurns).toHaveLength(0);
         }
     );
 

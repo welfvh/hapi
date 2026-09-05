@@ -87,14 +87,11 @@ function getNormalizedDeliveryMode(
     requestedDeliveryMode: MessageDeliveryMode | undefined,
     scheduledAt: number | null | undefined
 ): MessageDeliveryMode {
-    if (isObject(metadata) && metadata.flavor === 'codex' && scheduledAt == null) {
-        return 'steer'
-    }
     if (requestedDeliveryMode !== 'steer' || scheduledAt != null) {
         return 'queue'
     }
 
-    return isObject(metadata) && metadata.flavor === 'pi' ? 'steer' : 'queue'
+    return isObject(metadata) && (metadata.flavor === 'pi' || metadata.flavor === 'codex') ? 'steer' : 'queue'
 }
 
 /**

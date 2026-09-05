@@ -1161,7 +1161,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
 
 describe('MessageService.sendMessage deliveryMode', () => {
     for (const deliveryMode of [undefined, 'queue', 'steer'] as const) {
-        it(`marks live Codex ${deliveryMode ?? 'default'} input for steering, but never its backfill`, async () => {
+        it(`preserves live Codex ${deliveryMode ?? 'default'} intent, but queues its backfill`, async () => {
             const store = makeStore()
             const session = store.sessions.getOrCreateSession(
                 'codex-live', { path: '/tmp/codex-live', flavor: 'codex' }, null, 'default'
@@ -1170,7 +1170,7 @@ describe('MessageService.sendMessage deliveryMode', () => {
             const service = new MessageService(store, io, makePublisher() as any)
             await service.sendMessage(session.id, { text: 'followup', localId: 'codex-live-id', deliveryMode })
             expect(cliEmitted[0]).toMatchObject({
-                body: { message: { localId: 'codex-live-id', content: { meta: { deliveryMode: 'steer' } } } }
+                body: { message: { localId: 'codex-live-id', content: { meta: { deliveryMode: deliveryMode ?? 'queue' } } } }
             })
             const rows = service.getDeliverableMessagesAfter(session.id, { afterSeq: 0, limit: 10, now: Date.now() })
             expect(rows).toHaveLength(0)
