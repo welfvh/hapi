@@ -478,6 +478,15 @@ export class MessageService {
             if (ackResult === 'consumed') {
                 return this.recordConsumedAcknowledgement(sessionId, localId)
             }
+            if (ackResult === 'removed' && this.hasSingleCliSocket(sessionId)) {
+                this.store.messages.deleteQueuedMessageById(sessionId, resolvedId)
+                const settled = this.store.messages.lookupQueuedMessage(sessionId, resolvedId)
+                if (settled.status === 'invoked') return settled
+                if (settled.status !== 'absent') return { status: 'busy', localId }
+                this.forgetScheduledMatureNotified([localId])
+                this.publisher.emit({ type: 'message-cancelled', sessionId, messageId, localId })
+                return { status: 'cancelled', localId }
+            }
             // The native request may have reached the agent while the cancel
             // round-trip was pending. Never delete a live dispatch; hold it as
             // unknown and let the user explicitly retry or discard afterwards.

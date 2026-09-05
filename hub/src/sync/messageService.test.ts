@@ -96,6 +96,34 @@ function makePublisher() {
     }
 }
 
+describe('dispatch-claimed queue cancellation', () => {
+    it('deletes only after the single wrapper positively removes the queued localId', async () => {
+        const store = makeStore()
+        try {
+            const session = makeSession(store, 'dispatch-cancel')
+            const message = store.messages.addMessage(session.id, 'queued', 'queued-local')
+            store.messages.claimMessagesForDispatch(session.id, ['queued-local'])
+            const service = new MessageService(store, makeIo(ack => ack(null, [{ removed: true }])), makePublisher() as any)
+            expect(await service.cancelQueuedMessage(session.id, message.id)).toEqual({ status: 'cancelled', localId: 'queued-local' })
+            expect(store.messages.lookupQueuedMessage(session.id, message.id).status).toBe('absent')
+        } finally { store.close() }
+    })
+
+    it('retains ambiguous live dispatch or multiple ownership despite a removal response', async () => {
+        for (const socketCount of [1, 2]) {
+            const store = makeStore()
+            try {
+                const session = makeSession(store, `dispatch-busy-${socketCount}`)
+                const message = store.messages.addMessage(session.id, 'queued', 'queued-local')
+                store.messages.claimMessagesForDispatch(session.id, ['queued-local'])
+                const service = new MessageService(store, makeIo(ack => ack(null, [{ removed: true, inFlight: socketCount === 1 }]), socketCount), makePublisher() as any)
+                expect(await service.cancelQueuedMessage(session.id, message.id)).toEqual({ status: 'busy', localId: 'queued-local' })
+                expect(store.messages.lookupQueuedMessage(session.id, message.id).status).toBe('indeterminate')
+            } finally { store.close() }
+        }
+    })
+})
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
