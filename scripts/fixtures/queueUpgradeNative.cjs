@@ -5,9 +5,16 @@ const threadId = 'synthetic-upgrade-native';
 const send = message => process.stdout.write(`${JSON.stringify(message)}\n`);
 readline.createInterface({ input: process.stdin }).on('line', line => {
     const request = JSON.parse(line);
-    if (request.id === undefined) return;
     const params = request.params || {};
-    appendFileSync(process.env.REHEARSAL_NATIVE_LOG, `${JSON.stringify({ pid: process.pid, method: request.method, threadId: params.threadId, input: params.input, model: params.model, effort: params.effort })}\n`);
+    const probe = ['thread/fork', 'thread/rollback'].includes(request.method) && params.threadId === '__hapi_capability_probe__';
+    const allowed = ['initialize', 'initialized', 'model/list', 'skills/list', 'collaborationMode/list', 'experimentalFeature/enablement/set', 'thread/start', 'thread/resume', 'thread/read', 'thread/goal/get', 'turn/start'];
+    const rejected = (!allowed.includes(request.method) && !probe) || (request.id === undefined && request.method !== 'initialized');
+    appendFileSync(process.env.REHEARSAL_NATIVE_LOG, `${JSON.stringify({ pid: process.pid, method: request.method, threadId: params.threadId, input: params.input, model: params.model, effort: params.effort, rejected })}\n`);
+    if (rejected || probe) {
+        if (request.id !== undefined) send({ id: request.id, error: { code: rejected ? -32601 : -32602, message: rejected ? 'Forbidden or unsupported rehearsal method' : 'Unknown synthetic probe thread' } });
+        return;
+    }
+    if (request.id === undefined) return;
     let result = {};
     if (request.method === 'initialize') result = { userAgent: 'isolated-synthetic-native' };
     else if (request.method === 'model/list') result = { data: [], nextCursor: null };

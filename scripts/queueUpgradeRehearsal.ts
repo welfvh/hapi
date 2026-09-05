@@ -112,6 +112,13 @@ function nativeEvents(): any[] {
     return existsSync(nativeLog) ? readFileSync(nativeLog, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
 }
 
+function assertNativeQueueOnly(): void {
+    const entries = nativeEvents();
+    assert(!entries.some(entry => entry.method === 'turn/steer'), 'Queue rehearsal must never steer');
+    assert(!entries.some(entry => entry.method === 'turn/interrupt'), 'Queue rehearsal must never send native interrupt');
+    assert(!entries.some(entry => entry.rejected), 'Native fixture rejected an unexpected method');
+}
+
 function snapshot(): any {
     const store = new Store(database);
     try {
@@ -161,6 +168,7 @@ try {
     const before = snapshot();
     assert.deepEqual(before.pending.map((item: any) => item.localId), ['keep-first', 'keep-second', 'scheduled-kept', 'edit-new', 'unknown-kept']);
     assert.equal(nativeEvents().filter(entry => entry.method === 'turn/start').length, 1);
+    assertNativeQueueOnly();
     writeFileSync(join(output, 'before.json'), JSON.stringify(before, null, 2));
     const interrupted = ownedPids().filter(pid => pid !== hub.pid);
     events.push({ interruptedExecutables: interrupted.map(pid => ({ pid, executableSha256: createHash('sha256').update(readFileSync(`/proc/${pid}/exe`)).digest('hex') })) });
@@ -190,17 +198,21 @@ try {
     const final = snapshot();
     assert.deepEqual(final.pending.map((item: any) => item.localId), ['scheduled-kept', 'unknown-kept']);
     const delivered = nativeEvents().filter(entry => entry.method === 'turn/start').slice(1).flatMap(entry => entry.input ?? []).map(item => item.text ?? '').join('\n');
-    assert(delivered.includes('keep-first') && delivered.includes('keep-second') && delivered.includes('EDITED text retained'));
-    assert(delivered.indexOf('keep-first') < delivered.indexOf('keep-second'));
-    assert(!delivered.includes('remove-me') && !delivered.includes('edit-old'));
-    assert(!delivered.includes('UNRESOLVED'));
+    assert.equal(delivered, ['keep-first', 'keep-second', 'EDITED text retained'].join('\n'));
+    assertNativeQueueOnly();
     assert.equal(final.model, before.model);
     assert.equal(final.modelReasoningEffort, before.modelReasoningEffort);
     assert.equal(final.serviceTier, before.serviceTier);
     const replacementTurns = nativeEvents().filter(entry => entry.method === 'turn/start').slice(1);
     assert(replacementTurns.every(entry => entry.effort === 'medium'));
+    assert(replacementTurns.every(entry => entry.threadId === 'synthetic-upgrade-native' && entry.input.every((item: any) => item.type === 'text')));
     for (const text of ['keep-first', 'keep-second', 'EDITED text retained']) assert.equal(delivered.split(text).length - 1, 1);
     assert(nativeEvents().some(entry => entry.method === 'thread/resume' && entry.model === 'gpt-6-astra'));
+    events.push({ nativeSafety: {
+        steerCalls: nativeEvents().filter(entry => entry.method === 'turn/steer').length,
+        interruptCalls: nativeEvents().filter(entry => entry.method === 'turn/interrupt').length,
+        rejectedCalls: nativeEvents().filter(entry => entry.rejected).length,
+    }, replacementDeliveryText: delivered });
     events.push({ finalPendingIds: final.pending.map((item: any) => item.localId), finalNativeId: final.metadata.codexSessionId });
     passed = true;
 } catch (error) {

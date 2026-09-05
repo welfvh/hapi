@@ -5,9 +5,10 @@
  * Race-B: CLI ack returns { removed: false } → indeterminate + status='busy'
  * Race-C: CLI ack times out (500 ms)         → indeterminate + status='busy'
  * Race-D (CLI offline): no CLI socket in room → immediate DELETE, message-cancelled emit, no ack call
- * Race-E (partial ack): broadcast ack receives err + [{ removed: true }] → DELETE + status='cancelled'
+ * Race-E (partial ack): retain indeterminate state; never treat timeout as removal.
  */
 import { describe, expect, it } from 'bun:test'
+import { EventEmitter } from 'node:events'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -79,11 +80,12 @@ function makeIo(onEmit: (ack: AckCallback) => void, socketCount = 1): Server {
     const socketSet = socketCount > 0
         ? new Set(Array.from({ length: socketCount }, (_, i) => `socket-${i}`))
         : undefined
+    const adapter = Object.assign(new EventEmitter(), { rooms: { get: (_roomName: string) => socketSet } })
 
     return {
         of: (_ns: string) => ({
             to: (_room: string) => broadcastRoom,
-            adapter: { rooms: { get: (_roomName: string) => socketSet } }
+            adapter
         })
     } as unknown as Server
 }
@@ -97,6 +99,45 @@ function makePublisher() {
 }
 
 describe('dispatch-claimed queue cancellation', () => {
+    for (const scenario of ['two-owner-disconnect-partial', 'sole-owner-disconnect-partial', 'owner-replaced', 'membership-flap', 'partial-timeout'] as const) {
+        it(`retains dispatch-claimed IDs for ${scenario}`, async () => {
+            const store = makeStore()
+            try {
+                const session = makeSession(store, scenario)
+                const roomName = `session:${session.id}`
+                const owners = new Set(scenario === 'two-owner-disconnect-partial' ? ['owner-a', 'owner-b'] : ['owner-a'])
+                const adapter = Object.assign(new EventEmitter(), { rooms: new Map([[roomName, owners]]) })
+                let emitted = false
+                const io = { of: () => ({ adapter, to: () => ({ timeout: () => ({ emit: (_event: string, _payload: unknown, ack: AckCallback) => {
+                    emitted = true
+                    if (scenario === 'two-owner-disconnect-partial') owners.delete('owner-b')
+                    if (scenario === 'sole-owner-disconnect-partial') {
+                        owners.clear()
+                        adapter.emit('leave-room', roomName, 'owner-a')
+                    }
+                    if (scenario === 'owner-replaced') { owners.delete('owner-a'); owners.add('owner-b') }
+                    if (scenario === 'membership-flap') {
+                        owners.add('owner-b')
+                        adapter.emit('join-room', roomName, 'owner-b')
+                        owners.delete('owner-b')
+                        adapter.emit('leave-room', roomName, 'owner-b')
+                    }
+                    ack(scenario.includes('partial') ? new Error('partial timeout') : null, [{ removed: true }])
+                } }) }) }) } as unknown as Server
+                const message = store.messages.addMessage(session.id, 'held', 'held-local')
+                store.messages.claimMessagesForDispatch(session.id, ['held-local'])
+                const publisher = makePublisher()
+                const pending = new MessageService(store, io, publisher as any).cancelQueuedMessage(session.id, message.id)
+                if (scenario === 'two-owner-disconnect-partial') owners.delete('owner-b')
+                expect(await pending).toEqual({ status: 'busy', localId: 'held-local' })
+                expect(store.messages.lookupQueuedMessage(session.id, message.id).status).toBe('indeterminate')
+                expect(publisher.events.some(event => event.type === 'message-cancelled' || event.type === 'messages-consumed')).toBe(false)
+                expect(adapter.listenerCount('join-room') + adapter.listenerCount('leave-room')).toBe(0)
+                if (scenario === 'two-owner-disconnect-partial') expect(emitted).toBe(false)
+            } finally { store.close() }
+        })
+    }
+
     it('deletes only after the single wrapper positively removes the queued localId', async () => {
         const store = makeStore()
         try {
@@ -812,7 +853,7 @@ describe('MessageService.cancelQueuedMessage race scenarios', () => {
     })
 
     describe('Race-E: partial ack — broadcast callback receives err + [{ removed: true }]', () => {
-        it('returns cancelled and deletes row when at least one socket acked removal, even if err is set', async () => {
+        it('retains the row when a positive removal accompanies timeout', async () => {
             const store = makeStore()
             const session = makeSession(store, 'race-e')
             const msg = store.messages.addMessage(
@@ -831,18 +872,15 @@ describe('MessageService.cancelQueuedMessage race scenarios', () => {
             const service = new MessageService(store, io, publisher as any)
             const result = await service.cancelQueuedMessage(session.id, msg.id)
 
-            // The live socket's ack must win — cancel is confirmed
-            expect(result.status).toBe('cancelled')
+            expect(result.status).toBe('busy')
 
-            // Row must be deleted
             const remaining = store.messages.getUninvokedLocalMessages(session.id)
-            expect(remaining).toHaveLength(0)
+            expect(remaining).toHaveLength(1)
+            expect(remaining[0].deliveryState).toBe('indeterminate')
 
-            // message-cancelled SSE must have been emitted
             const cancelled = publisher.events.find(e => e.type === 'message-cancelled')
-            expect(cancelled).toBeDefined()
+            expect(cancelled).toBeUndefined()
 
-            // No messages-consumed (row deleted, not invoked)
             const consumedCount = publisher.events.filter(e => e.type === 'messages-consumed').length
             expect(consumedCount).toBe(0)
         })
@@ -995,7 +1033,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
                         emit: () => {}
                     })
                 }),
-                adapter: { rooms: { get: () => new Set(['cli-1']) } }
+                adapter: Object.assign(new EventEmitter(), { rooms: { get: () => new Set(['cli-1']) } })
             }),
             _emittedUpdates: emittedUpdates
         } as unknown as Server
@@ -1015,7 +1053,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => new Set(['cli-1']) } }
+                adapter: Object.assign(new EventEmitter(), { rooms: { get: () => new Set(['cli-1']) } })
             })
         } as unknown as Server
 
@@ -1055,7 +1093,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => new Set(['cli-1']) } }
+                adapter: Object.assign(new EventEmitter(), { rooms: { get: () => new Set(['cli-1']) } })
             })
         } as unknown as Server
 
@@ -1084,7 +1122,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => new Set(['cli-1']) } }
+                adapter: Object.assign(new EventEmitter(), { rooms: { get: () => new Set(['cli-1']) } })
             })
         } as unknown as Server
 
@@ -1117,7 +1155,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => new Set(['cli-1']) } }
+                adapter: Object.assign(new EventEmitter(), { rooms: { get: () => new Set(['cli-1']) } })
             })
         } as unknown as Server
 
@@ -1242,7 +1280,7 @@ describe('MessageService.sendMessage deliveryMode', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => sockets.size > 0 ? sockets : undefined } }
+                adapter: Object.assign(new EventEmitter(), { rooms: { get: () => sockets.size > 0 ? sockets : undefined } })
             })
         } as unknown as Server
         return { io, cliEmitted }
@@ -1376,7 +1414,7 @@ describe('MessageService.sendMessage deliveryMode', () => {
         const retryUpdates: any[] = []
         const retryIo = {
             of: () => ({
-                adapter: { rooms: { get: () => new Set(['new-runner']) } },
+                adapter: Object.assign(new EventEmitter(), { rooms: { get: () => new Set(['new-runner']) } }),
                 to: () => ({
                     timeout: () => ({
                         emit: (_event: string, update: any, callback: (error: Error | null, responses: any[]) => void) => {
@@ -1541,7 +1579,7 @@ describe('MessageService.releaseMatureScheduledMessages', () => {
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => new Set(['cli-1']) } }
+                adapter: Object.assign(new EventEmitter(), { rooms: { get: () => new Set(['cli-1']) } })
             })
         } as unknown as Server
         return { io, cliEmitted }
@@ -1708,7 +1746,7 @@ describe('MessageService.releaseMatureScheduledMessages', () => {
                         },
                         timeout: (_ms: number) => ({ emit: () => {} })
                     }),
-                    adapter: { rooms: { get: () => new Set(['cli-1']) } }
+                    adapter: Object.assign(new EventEmitter(), { rooms: { get: () => new Set(['cli-1']) } })
                 })
             } as unknown as Server
             const publisher2 = { emit: () => {}, events: [] }
@@ -1743,7 +1781,7 @@ describe('MessageService.sweepImmediateQueuedOnSessionEnd — scheduled rows are
                     emit: () => {},
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => new Set(['cli-1']) } }
+                adapter: Object.assign(new EventEmitter(), { rooms: { get: () => new Set(['cli-1']) } })
             })
         } as unknown as Server
     }
@@ -1758,7 +1796,7 @@ describe('MessageService.sweepImmediateQueuedOnSessionEnd — scheduled rows are
                     },
                     timeout: (_ms: number) => ({ emit: () => {} })
                 }),
-                adapter: { rooms: { get: () => new Set(['cli-1']) } }
+                adapter: Object.assign(new EventEmitter(), { rooms: { get: () => new Set(['cli-1']) } })
             })
         } as unknown as Server
         return { io, cliEmitted }

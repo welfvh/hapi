@@ -474,11 +474,14 @@ export class MessageService {
         // A live dispatch is not cancellable by timeout. Convert it to the
         // durable unknown state and require a second explicit resolution.
         if (isDispatching) {
+            const owners = this.io.of('/cli').adapter.rooms.get(`session:${sessionId}`)
+            const ownerId = owners?.size === 1 ? owners.values().next().value : undefined
             const ackResult = await this.requestCliCancelAck(sessionId, localId, messageId, 500)
             if (ackResult === 'consumed') {
                 return this.recordConsumedAcknowledgement(sessionId, localId)
             }
-            if (ackResult === 'removed' && this.hasSingleCliSocket(sessionId)) {
+            const currentOwners = this.io.of('/cli').adapter.rooms.get(`session:${sessionId}`)
+            if (ackResult === 'removed' && ownerId && currentOwners?.size === 1 && currentOwners.has(ownerId)) {
                 this.store.messages.deleteQueuedMessageById(sessionId, resolvedId)
                 const settled = this.store.messages.lookupQueuedMessage(sessionId, resolvedId)
                 if (settled.status === 'invoked') return settled
@@ -743,10 +746,30 @@ export class MessageService {
         timeoutMs: number
     ): Promise<'removed' | 'in-flight' | 'indeterminate' | 'consumed' | 'not-found' | 'timeout'> {
         return new Promise((resolve) => {
-            const room = this.io.of('/cli').to(`session:${sessionId}`)
+            const namespace = this.io.of('/cli')
+            const roomName = `session:${sessionId}`
+            const adapter = namespace.adapter
+            const owners = adapter.rooms.get(roomName)
+            const ownerId = owners?.size === 1 ? owners.values().next().value : undefined
+            if (!ownerId) {
+                resolve('indeterminate')
+                return
+            }
+            let ownershipChanged = false
+            const membershipChanged = (changedRoom: string) => {
+                if (changedRoom === roomName) ownershipChanged = true
+            }
+            adapter.on('join-room', membershipChanged)
+            adapter.on('leave-room', membershipChanged)
+            const finish = (result: 'removed' | 'in-flight' | 'indeterminate' | 'consumed' | 'not-found' | 'timeout') => {
+                adapter.off('join-room', membershipChanged)
+                adapter.off('leave-room', membershipChanged)
+                resolve(result)
+            }
+            const room = namespace.to(ownerId)
             // socket.io v4 BroadcastOperator: .timeout(ms).emit(event, data, ackCb)
             // ack signature: (err: Error | null, responses: T[])
-            room.timeout(timeoutMs).emit(
+            try { room.timeout(timeoutMs).emit(
                 'update',
                 {
                     id: randomUUID(),
@@ -760,36 +783,35 @@ export class MessageService {
                     }
                 },
                 (err: Error | null, responses: Array<{ removed: boolean; inFlight?: boolean; indeterminate?: boolean; consumed?: boolean }>) => {
-                    // Check responses before err: in a reconnect overlap or any room with
-                    // multiple CLI sockets, Socket.IO may set err (one socket timed out)
-                    // while still delivering successful responses from the sockets that did
-                    // ack. An explicit in-flight report dominates: one socket may be
-                    // dispatching the steer while a stale duplicate socket reports
-                    // removed — deleting the row then would orphan the executing message.
+                    const currentOwners = adapter.rooms.get(roomName)
+                    if (ownershipChanged || currentOwners?.size !== 1 || !currentOwners.has(ownerId)) {
+                        finish('indeterminate')
+                        return
+                    }
+                    if (err || responses?.length !== 1) {
+                        finish('timeout')
+                        return
+                    }
                     if (responses?.some((r) => r.consumed === true)) {
-                        resolve('consumed')
+                        finish('consumed')
                         return
                     }
                     if (responses?.some((r) => r.indeterminate === true)) {
-                        resolve('indeterminate')
+                        finish('indeterminate')
                         return
                     }
                     if (responses?.some((r) => r.inFlight === true)) {
-                        resolve('in-flight')
+                        finish('in-flight')
                         return
                     }
                     const removed = responses?.some((r) => r.removed === true) ?? false
                     if (removed) {
-                        resolve('removed')
+                        finish('removed')
                         return
                     }
-                    if (err) {
-                        resolve('timeout')
-                        return
-                    }
-                    resolve('not-found')
+                    finish('not-found')
                 }
-            )
+            ) } catch { finish('indeterminate') }
         })
     }
 

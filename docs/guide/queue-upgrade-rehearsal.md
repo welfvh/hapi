@@ -45,6 +45,18 @@ Fix `16bbf0d0` honors only positive removal with one current CLI owner, preserve
 invoked-state races, and keeps ambiguous or multiple-owner outcomes unresolved.
 Regression tests accompany the fix; it requires independent release review.
 
+The follow-on owner-race correction supersedes the count-only check in 16bbf0d0:
+capture the sole socket ID before requesting cancellation, address that socket,
+invalidate on any session-room join/leave during the request, require exactly one
+error-free response from unchanged membership, and recheck the captured ID before
+dispatch-claimed deletion. Partial ACK plus timeout never proves removal. Tests
+cover two owners shrinking to one, disconnection, replacement and transient overlap.
+
+The native fixture rejects all undeclared methods (including steer/interrupt),
+with negative tests using its actual child process. Rehearsal asserts no steer or
+interrupt anywhere in its native log and exact equality of the complete replacement
+delivery text sequence, not just a prefix or the first pair's relative order.
+
 A naive hub-stop followed by graceful SIGTERM is not this tested boundary: an
 exiting wrapper can dispatch queued work during cleanup. The interruption fixture
 therefore freezes the owned generation before stopping the hub, then terminates
