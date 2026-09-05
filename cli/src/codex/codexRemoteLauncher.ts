@@ -1896,6 +1896,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             loopWakeWaiter = null;
             waiter();
         };
+        session.queue.setOnMessage(wakeLoop);
+        const automaticSteerAttempts = new Set<string>();
 
         appServerClient.setTransportAbandonedHandler(() => {
             // The old process is gone; its foreground turn cannot deliver more
@@ -1910,7 +1912,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         });
 
         const waitForTurnOrRecovery = (signal: AbortSignal): Promise<void> => new Promise((resolve) => {
-            if (!turnInFlight && !recoveryInFlight) {
+            if (signal.aborted || (!turnInFlight && !recoveryInFlight)) {
                 resolve();
                 return;
             }
@@ -2096,8 +2098,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         };
 
         // Per-message steer from the waiting queue (web "Steer" button).
-        session.client.rpcHandlerManager.registerHandler(
-            RPC_METHODS.SteerQueuedMessage,
+        const steerQueuedMessage =
             async (payload: unknown) => {
                 const localId = typeof (payload as { localId?: unknown } | null)?.localId === 'string'
                     ? (payload as { localId: string }).localId
@@ -2234,7 +2235,10 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 }
                 await restoreQueuedReservation();
                 return { steered: false, error: 'Active turn is not steerable' };
-            }
+            };
+        session.client.rpcHandlerManager.registerHandler(
+            RPC_METHODS.SteerQueuedMessage,
+            (payload: unknown) => steerQueuedMessage(payload).finally(wakeLoop)
         );
 
         const clearCompactRecovery = (recovery: typeof compactRecovery) => {
@@ -4005,7 +4009,18 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 continue;
             }
 
-            if (!pending && turnInFlight && session.queue.size() === 0) {
+            const next = session.queue.queue[0];
+            const nextIsControl = next && (parseCodexSpecialCommand(next.message).type || parseGoalCommand(next.message));
+            if (!pending && turnInFlight && !nextIsControl) {
+                if (next?.localId
+                    && next.mode.deliveryMode === 'steer'
+                    && !next.isolate
+                    && next.modeHash === activeMessage?.hash
+                    && !automaticSteerAttempts.has(next.localId)) {
+                    automaticSteerAttempts.add(next.localId);
+                    await steerQueuedMessage({ localId: next.localId });
+                    continue;
+                }
                 await waitForTurnOrRecovery(this.abortController.signal);
                 if (this.abortController.signal.aborted && !this.shouldExit) {
                     logger.debug('[codex]: Internal wait aborted while turn was active; continuing');
@@ -4013,6 +4028,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 }
                 continue;
             }
+            automaticSteerAttempts.clear();
 
             let message: QueuedMessage | null = pending;
             const isRetryMessage = Boolean(message);
@@ -4284,6 +4300,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
 
     protected async cleanup(): Promise<void> {
         logger.debug('[codex-remote]: cleanup start');
+        this.session.queue.setOnMessage(null);
         this.appServerClient.setTransportAbandonedHandler(null);
         this.appServerClient.setStderrHandler(null);
         try {

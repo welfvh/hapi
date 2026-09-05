@@ -87,6 +87,9 @@ function getNormalizedDeliveryMode(
     requestedDeliveryMode: MessageDeliveryMode | undefined,
     scheduledAt: number | null | undefined
 ): MessageDeliveryMode {
+    if (isObject(metadata) && metadata.flavor === 'codex' && scheduledAt == null) {
+        return 'steer'
+    }
     if (requestedDeliveryMode !== 'steer' || scheduledAt != null) {
         return 'queue'
     }

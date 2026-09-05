@@ -283,7 +283,7 @@ export async function runCodex(opts: {
                     messageQueue.pushIsolateAndClear(isolatedCommandText, enhancedMode, localId);
                     return;
                 }
-                messageQueue.push(text, enhancedMode, localId);
+                messageQueue.push(text, { ...enhancedMode, deliveryMode: message.meta?.deliveryMode }, localId);
             } catch (error) {
                 logger.debug('[Codex] Failed to handle user message', error);
                 const enhancedMode: EnhancedMode = {
@@ -295,7 +295,10 @@ export async function runCodex(opts: {
                     serviceTier: currentServiceTier,
                     personality: currentPersonality
                 };
-                messageQueue.push(formatMessageWithAttachments(message.content.text, message.content.attachments), enhancedMode, localId);
+                messageQueue.push(formatMessageWithAttachments(message.content.text, message.content.attachments), {
+                    ...enhancedMode,
+                    deliveryMode: message.meta?.deliveryMode
+                }, localId);
             }
         }).catch((error) => {
             logger.debug('[Codex] User message handler chain failed', error);

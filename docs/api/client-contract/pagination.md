@@ -167,7 +167,7 @@ After a reconnect whose handshake said `resume: 'gap'` (an `ok` resume replayed 
 | `localId` | string | Optional but **required for `scheduledAt`**, and required in practice: without it the row is stamped invoked at insert (no queue/ack/cancel path). |
 | `attachments` | `AttachmentMetadata[]` | Optional. Not allowed with `scheduledAt`. |
 | `scheduledAt` | epoch ms | Optional. Must be ≤ now + **7 days**; requires `localId`; no attachments; never `steer`. |
-| `deliveryMode` | `'queue'` \| `'steer'` | Optional, default `queue`. `steer` is honored only for **Pi-flavor** sessions and never for scheduled sends — the hub silently normalizes everything else to `queue`, and deferred/replayed delivery (reconnect backfill, retries, scheduled release) always degrades `steer` to `queue`. |
+| `deliveryMode` | `'queue'` \| `'steer'` | Unscheduled **Codex** sends normalize to `steer`, including omitted intent and legacy clients sending `queue`. With a `localId`, the runner steers compatible input into the active turn and acknowledges only positive acceptance; mode-mismatched or isolated input waits. Without an active turn it starts normally. **Pi** retains explicit `steer`; other flavors normalize to `queue`. Scheduled sends and deferred/replayed delivery (reconnect backfill, retries, scheduled release) remain `queue` and do not automatically steer a later turn. |
 
 Response `{"ok": true}`. Sending to an inactive session returns `409 {"error":"Session is inactive","code":"session_inactive"}` — resume/reopen first, and note the resumed session **may have a different id** (migrate drafts and re-target, see [rest](./rest.md)).
 

@@ -1160,6 +1160,49 @@ describe('MessageService.sendMessage with scheduledAt', () => {
 })
 
 describe('MessageService.sendMessage deliveryMode', () => {
+    for (const deliveryMode of [undefined, 'queue', 'steer'] as const) {
+        it(`marks live Codex ${deliveryMode ?? 'default'} input for steering, but never its backfill`, async () => {
+            const store = makeStore()
+            const session = store.sessions.getOrCreateSession(
+                'codex-live', { path: '/tmp/codex-live', flavor: 'codex' }, null, 'default'
+            )
+            const { io, cliEmitted } = makeTrackingIo()
+            const service = new MessageService(store, io, makePublisher() as any)
+            await service.sendMessage(session.id, { text: 'followup', localId: 'codex-live-id', deliveryMode })
+            expect(cliEmitted[0]).toMatchObject({
+                body: { message: { localId: 'codex-live-id', content: { meta: { deliveryMode: 'steer' } } } }
+            })
+            const rows = service.getDeliverableMessagesAfter(session.id, { afterSeq: 0, limit: 10, now: Date.now() })
+            expect(rows).toHaveLength(0)
+            await service.sendMessage(session.id, { text: 'followup', localId: 'codex-live-id', deliveryMode })
+            expect(cliEmitted).toHaveLength(1)
+            store.messages.addMessage(session.id, {
+                role: 'user', content: { type: 'text', text: 'legacy queued steer' }, meta: { deliveryMode: 'steer' }
+            }, 'codex-backfill-id')
+            const backfill = service.getDeliverableMessagesAfter(session.id, { afterSeq: 0, limit: 10, now: Date.now() })
+            expect(backfill[0]?.content).toMatchObject({ meta: { deliveryMode: 'queue' } })
+        })
+    }
+
+    for (const offset of [-1000, 60_000]) {
+        it(`never marks scheduled Codex input for steering (offset ${offset})`, async () => {
+            const store = makeStore()
+            const session = store.sessions.getOrCreateSession(
+                'codex-scheduled', { path: '/tmp/codex-scheduled', flavor: 'codex' }, null, 'default'
+            )
+            const { io, cliEmitted } = makeTrackingIo()
+            const service = new MessageService(store, io, makePublisher() as any)
+            await service.sendMessage(session.id, {
+                text: 'scheduled', localId: 'codex-scheduled-id', deliveryMode: 'steer', scheduledAt: Date.now() + offset
+            })
+            expect(store.messages.getUninvokedLocalMessages(session.id)[0]?.content).toMatchObject({
+                meta: { deliveryMode: 'queue' }
+            })
+            if (offset > 0) expect(cliEmitted).toHaveLength(0)
+            else expect(cliEmitted[0]).toMatchObject({ body: { message: { content: { meta: { deliveryMode: 'queue' } } } } })
+        })
+    }
+
     function makeTrackingIo(socketCount = 1): { io: Server; cliEmitted: unknown[] } {
         const cliEmitted: unknown[] = []
         const sockets = new Set(Array.from({ length: socketCount }, (_, index) => `cli-${index}`))

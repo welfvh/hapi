@@ -34,6 +34,7 @@ const harness = vi.hoisted(() => ({
     startTurnThreadIds: [] as string[],
     startTurnParams: [] as Array<Record<string, unknown>>,
     startTurnErrors: [] as Error[],
+    onStartTurn: null as (() => void) | null,
     interruptedTurns: [] as Array<{ threadId: string; turnId: string }>,
     interruptErrors: [] as Error[],
     rollbackCalls: [] as Array<{ threadId: string; numTurns: number }>,
@@ -60,6 +61,7 @@ const harness = vi.hoisted(() => ({
     steerTurnParams: [] as Array<Record<string, unknown>>,
     steerDispatchError: null as Error | null,
     steerCompletionError: null as Error | null,
+    steerCompletion: null as Promise<unknown> | null,
     readThreadParams: [] as Array<Record<string, unknown>>,
     readThreadError: null as Error | null,
     readThreadResponse: { thread: { turns: [] as unknown[] } } as { thread: { turns?: Array<{ items?: Array<Record<string, unknown>> }> } },
@@ -225,9 +227,9 @@ vi.mock('./codexAppServerClient', () => {
             }
             return {
                 dispatched: Promise.resolve(),
-                completed: harness.steerCompletionError
+                completed: harness.steerCompletion ?? (harness.steerCompletionError
                     ? Promise.reject(harness.steerCompletionError)
-                    : Promise.resolve({ turnId: 'steered-turn' })
+                    : Promise.resolve({ turnId: 'steered-turn' }))
             };
         }
 
@@ -266,6 +268,7 @@ vi.mock('./codexAppServerClient', () => {
             const started = { turn: { id: turnId } };
             harness.notifications.push({ method: 'turn/started', params: started });
             this.notificationHandler?.('turn/started', started);
+            if (harness.startTurnThreadIds.length === 1) harness.onStartTurn?.();
 
             if (harness.remainingThreadSystemErrors > 0) {
                 harness.remainingThreadSystemErrors -= 1;
@@ -1116,7 +1119,7 @@ function createSessionStub(
     isolateMessages = false,
     closeQueue = true
 ) {
-    const queue = new MessageQueue2<EnhancedMode>((mode) => JSON.stringify(mode));
+    const queue = new MessageQueue2<EnhancedMode>(({ deliveryMode, ...mode }) => JSON.stringify(mode));
     messages.forEach((message, index) => {
         if (isolateMessages) {
             queue.pushIsolated(message, mode);
@@ -1246,11 +1249,133 @@ function createSessionStub(
 }
 
 describe('codexRemoteLauncher', () => {
+    it.each(['active-empty-wait', 'immediate-loop'])(
+        'automatically steers live followups arriving at %s without abort or another turn/start',
+        async (arrival) => {
+            harness.suppressTurnCompletion = true;
+            const { session, emitMessagesConsumed } = createSessionStub(['first'], createMode(), false, false);
+            const enqueue = () => session.queue.push('human followup', { ...createMode(), deliveryMode: 'steer' }, 'human-1');
+            if (arrival === 'immediate-loop') harness.onStartTurn = enqueue;
+            void codexRemoteLauncher(session as never);
+            await vi.waitFor(() => expect(harness.startTurnThreadIds).toHaveLength(1));
+            if (arrival === 'active-empty-wait') enqueue();
+
+            await vi.waitFor(() => expect(harness.steerTurnParams).toHaveLength(1));
+            expect(harness.steerTurnParams[0]).toMatchObject({
+                threadId: 'thread-1',
+                expectedTurnId: 'turn-1',
+                clientUserMessageId: 'human-1',
+                input: [{ type: 'text', text: 'human followup' }]
+            });
+            await vi.waitFor(() => expect(emitMessagesConsumed).toHaveBeenCalledWith(['human-1'], { steered: true }));
+            expect(harness.startTurnThreadIds).toHaveLength(1);
+            expect(harness.interruptedTurns).toHaveLength(0);
+            session.queue.close();
+        }
+    );
+
     it('invalidates queued steer handlers after abort or cleanup', () => {
         expect(isCurrentSteerHandler(3, 3, false)).toBe(true);
         expect(isCurrentSteerHandler(4, 3, false)).toBe(false);
         expect(isCurrentSteerHandler(3, 3, true)).toBe(false);
     });
+
+    it.each(['deferred', 'mode-mismatch', 'isolated', 'missing-local-id'])(
+        'keeps %s input queued while the active turn runs',
+        async (kind) => {
+            harness.suppressTurnCompletion = true;
+            const { session } = createSessionStub(['first'], createMode(), false, false);
+            void codexRemoteLauncher(session as never);
+            await vi.waitFor(() => expect(harness.startTurnThreadIds).toHaveLength(1));
+            const mode: EnhancedMode = {
+                ...createMode(),
+                deliveryMode: kind === 'deferred' ? 'queue' : 'steer',
+                ...(kind === 'mode-mismatch' ? { model: 'different-model' } : {})
+            };
+            if (kind === 'isolated') session.queue.pushIsolated('isolated input', mode, 'held-1');
+            else session.queue.push('held input', mode, kind === 'missing-local-id' ? undefined : 'held-1');
+            await new Promise((resolve) => setTimeout(resolve, 40));
+            expect(harness.steerTurnParams).toHaveLength(0);
+            expect(harness.startTurnThreadIds).toHaveLength(1);
+            expect(session.queue.size()).toBe(1);
+            expect(harness.interruptedTurns).toHaveLength(0);
+            session.queue.close();
+        }
+    );
+
+    it('acknowledges automatic steering only after positive acceptance', async () => {
+        harness.suppressTurnCompletion = true;
+        let accept!: () => void;
+        harness.steerCompletion = new Promise<void>((resolve) => { accept = resolve; });
+        const { session, emitMessagesConsumed } = createSessionStub(['first'], createMode(), false, false);
+        void codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(harness.startTurnThreadIds).toHaveLength(1));
+        session.queue.push('human followup', { ...createMode(), deliveryMode: 'steer' }, 'human-ack');
+        await vi.waitFor(() => expect(harness.steerTurnParams).toHaveLength(1));
+        expect(emitMessagesConsumed).not.toHaveBeenCalled();
+        expect(session.queue.cancelByLocalId('human-ack')).toBe('in-flight');
+        accept();
+        await vi.waitFor(() => expect(emitMessagesConsumed).toHaveBeenCalledWith(['human-ack'], { steered: true }));
+        session.queue.close();
+    });
+
+    it('steers multiple live followups separately in FIFO order with their own local IDs', async () => {
+        harness.suppressTurnCompletion = true;
+        const { session, emitMessagesConsumed } = createSessionStub(['first'], createMode(), false, false);
+        void codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(harness.startTurnThreadIds).toHaveLength(1));
+        session.queue.push('one', { ...createMode(), deliveryMode: 'steer' }, 'one-id');
+        session.queue.push('two', { ...createMode(), deliveryMode: 'steer' }, 'two-id');
+        await vi.waitFor(() => expect(emitMessagesConsumed).toHaveBeenCalledTimes(2));
+        expect(harness.steerTurnParams.map((params) => params.clientUserMessageId)).toEqual(['one-id', 'two-id']);
+        expect(harness.steerTurnParams.map((params) => params.input)).toEqual([
+            [{ type: 'text', text: 'one' }], [{ type: 'text', text: 'two' }]
+        ]);
+        expect(harness.startTurnThreadIds).toHaveLength(1);
+        session.queue.close();
+    });
+
+    it('does not overtake deferred input and delivers it after the active turn finishes', async () => {
+        harness.suppressTurnCompletion = true;
+        const { session } = createSessionStub(['first'], createMode(), false, false);
+        const run = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(harness.startTurnThreadIds).toHaveLength(1));
+        session.queue.push('deferred', { ...createMode(), deliveryMode: 'queue' }, 'deferred-id');
+        session.queue.push('later', { ...createMode(), deliveryMode: 'steer' }, 'later-id');
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        expect(harness.steerTurnParams).toHaveLength(0);
+        expect(harness.startTurnThreadIds).toHaveLength(1);
+        harness.suppressTurnCompletion = false;
+        session.queue.close();
+        harness.dispatchNotification?.('turn/completed', { threadId: 'thread-1', turn: { id: 'turn-1' } });
+        await run;
+        expect(harness.startTurnMessages).toEqual(['first', 'deferred\nlater']);
+        expect(harness.interruptedTurns).toHaveLength(0);
+    });
+
+    it.each(['rejected', 'indeterminate'])(
+        'does not automatically retry a %s steer or call turn/start while active',
+        async (outcome) => {
+            harness.suppressTurnCompletion = true;
+            const error = new Error(outcome);
+            if (outcome === 'indeterminate') Object.assign(error, { [INDETERMINATE_SYMBOL]: true });
+            harness.steerCompletionError = error;
+            const { session, emitMessagesConsumed, emitSteerIndeterminate } = createSessionStub(['first'], createMode(), false, false);
+            void codexRemoteLauncher(session as never);
+            await vi.waitFor(() => expect(harness.startTurnThreadIds).toHaveLength(1));
+            session.queue.push('human followup', { ...createMode(), deliveryMode: 'steer' }, 'human-failed');
+            await vi.waitFor(() => expect(harness.steerTurnParams).toHaveLength(1));
+            await new Promise((resolve) => setTimeout(resolve, 40));
+            session.queue.push('wake but do not retry', { ...createMode(), deliveryMode: 'queue' }, 'later');
+            await new Promise((resolve) => setTimeout(resolve, 40));
+            expect(harness.steerTurnParams).toHaveLength(1);
+            expect(harness.startTurnThreadIds).toHaveLength(1);
+            expect(emitMessagesConsumed).not.toHaveBeenCalled();
+            if (outcome === 'indeterminate') expect(emitSteerIndeterminate).toHaveBeenCalledWith(['human-failed']);
+            else expect(session.queue.queue[0]?.localId).toBe('human-failed');
+            session.queue.close();
+        }
+    );
 
     it('steers a queued message into the active turn and acks on dispatch', async () => {
         harness.suppressTurnCompletion = true;
@@ -1443,8 +1568,10 @@ describe('codexRemoteLauncher', () => {
         harness.deferCompactCompletion = false;
         harness.deferThreadStatusNotifications = false;
         harness.steerTurnParams = [];
+        harness.onStartTurn = null;
         harness.steerDispatchError = null;
         harness.steerCompletionError = null;
+        harness.steerCompletion = null;
         harness.readThreadParams = [];
         harness.readThreadError = null;
         harness.readThreadResponse = { thread: { turns: [] } };

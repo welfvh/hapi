@@ -16,6 +16,7 @@ export type CodexPersonality = 'friendly' | 'pragmatic' | 'none';
 
 export interface EnhancedMode {
     permissionMode: PermissionMode;
+    deliveryMode?: 'queue' | 'steer';
     model?: string;
     collaborationMode: CodexCollaborationMode;
     proactiveMultiAgent?: boolean;

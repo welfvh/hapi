@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { runCodex } from './runCodex'
+import type { MessageQueue2 } from '@/utils/MessageQueue2'
+import type { EnhancedMode } from './loop'
 
 const mockCodexSession = vi.hoisted(() => ({
     setPermissionMode: vi.fn(),
@@ -115,6 +117,24 @@ import { runCodex as runCodexImpl } from './runCodex'
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
 
 describe('runCodex', () => {
+    it.each(['steer', 'queue'] as const)('preserves %s delivery without changing the mode hash', async (deliveryMode) => {
+        const { runCodex: runCodexImpl } = await import('./runCodex')
+        await runCodexImpl({ workingDirectory: '/tmp/project' })
+        const onMessage = harness.session.onUserMessage.mock.calls[0][0]
+        onMessage({
+            role: 'user',
+            content: { type: 'text', text: 'followup' },
+            meta: { deliveryMode }
+        }, 'delivery-local')
+        const queue = harness.loopArgs[0].messageQueue as MessageQueue2<EnhancedMode>
+        await vi.waitFor(() => expect(queue.size()).toBe(1))
+        const item = queue.queue[0]
+        expect(item.localId).toBe('delivery-local')
+        expect(item.mode.deliveryMode).toBe(deliveryMode)
+        expect(queue.modeHasher({ ...item.mode, deliveryMode: 'queue' })).toBe(item.modeHash)
+        expect(queue.modeHasher({ ...item.mode, deliveryMode: 'steer' })).toBe(item.modeHash)
+    })
+
     beforeEach(() => {
         harness.bootstrapArgs.length = 0
         harness.loopArgs.length = 0
