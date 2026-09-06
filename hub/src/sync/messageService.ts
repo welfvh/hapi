@@ -885,7 +885,7 @@ export class MessageService {
         const admission = namespace && payload.localId ? this.store.addOriginMessage(
             namespace, sessionId, payload.localId, destination, content, payload.scheduledAt, payload.originReceiptVersion === 1
         ) : null
-        if (admission && !admission.delivery) {
+        if (admission && (!admission.delivery || !admission.delivery.inserted)) {
             return { actualSessionId: admission.receipt.resolvedSessionId, createdAt: admission.receipt.acceptedAt, receipt: admission.receipt, duplicate: true }
         }
         const inserted = admission?.delivery ?? this.store.addMessageForCurrentSession(

@@ -249,6 +249,58 @@ describe('alive incremental events', () => {
         expect(events.find((event) => event.type === 'session-updated')).toBeUndefined()
     })
 
+    it.each([null, 60_000])('legacy receipt backfill with schedule offset %s has no delivery, activity, SSE or thinking side effects', async offset => {
+        const store = new Store(':memory:')
+        const emitted: unknown[] = []
+        const broadcasts: unknown[] = []
+        const events: SyncEvent[] = []
+        const engine = new SyncEngine(store, {
+            of: () => ({
+                adapter: { rooms: { get: () => new Set(['synthetic-cli']) } },
+                to: () => ({ emit: (_event: string, value: unknown) => { emitted.push(value) } })
+            })
+        } as never, new RpcRegistry(), { broadcast: (value: unknown) => { broadcasts.push(value) } } as never)
+        const unsubscribe = engine.subscribe(event => events.push(event))
+        const originalNow = Date.now
+        const now = originalNow()
+        try {
+            Date.now = () => now
+            const session = engine.getOrCreateSession('legacy-backfill', { path: '/tmp/synthetic', host: 'test', flavor: 'codex' }, null, 'default')
+            engine.handleSessionAlive({ sid: session.id, time: now, thinking: false })
+            const localId = 'pre-migration-local-id'
+            const scheduledAt = offset === null ? null : now + offset
+            const message = store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'original legacy intent' } }, localId, scheduledAt)
+            const before = structuredClone(engine.getSession(session.id))
+            const storedBefore = store.sessions.getSession(session.id)
+            expect(before?.active).toBe(true)
+            expect(before?.thinking).toBe(false)
+            expect(store.lookupOriginReceipt('default', session.id, localId).status).toBe('legacy-unknown')
+            emitted.length = 0
+            broadcasts.length = 0
+            events.length = 0
+            Date.now = () => now + 1000
+            const receipt = await engine.sendMessage(session.id, {
+                text: 'retry cannot mutate original', localId, deliveryMode: 'steer',
+                originNamespace: 'default', originReceiptVersion: 1
+            })
+            expect(receipt?.messageId).toBe(message.id)
+            expect(receipt?.status).toBe('accepted')
+            if (!receipt) throw new Error('expected a persisted receipt')
+            expect(store.lookupOriginReceipt('default', session.id, localId)).toEqual(receipt)
+            expect(store.messages.getAllMessages(session.id)).toEqual([message])
+            expect(engine.getSession(session.id)).toEqual(before)
+            expect(store.sessions.getSession(session.id)).toEqual(storedBefore)
+            expect(emitted).toEqual([])
+            expect(broadcasts).toEqual([])
+            expect(events).toEqual([])
+        } finally {
+            Date.now = originalNow
+            unsubscribe()
+            engine.stop()
+            store.close()
+        }
+    })
+
     it('does not start a new thinking grace window for an accepted duplicate', async () => {
         const store = new Store(':memory:')
         const io = {

@@ -5,7 +5,7 @@ import type { OriginReceipt, OriginReceiptLookup } from '@hapi/protocol'
 export type { OriginReceipt, OriginReceiptLookup } from '@hapi/protocol'
 
 export class OriginReceiptError extends Error {
-    constructor(readonly code: 'origin_deleted' | 'origin_unavailable' | 'legacy_unknown' | 'routing_changed') {
+    constructor(readonly code: 'origin_deleted' | 'origin_unavailable' | 'legacy_unknown' | 'routing_changed' | 'origin_conflict') {
         super(code)
     }
 }

@@ -60,6 +60,44 @@ describe('permanent origin receipts', () => {
         expect(store.messages.getMessages(session.id)).toHaveLength(1)
     })
 
+    it.each(['covered', 'legacy'] as const)('rejects %s localId collision between origins sharing a destination', kind => {
+        const { store, session, localId: coveredId } = fixture()
+        const destination = store.sessions.getOrCreateSession('destination', {}, null, 'owner')
+        const otherOrigin = store.sessions.getOrCreateSession('other-origin', { supersededBySessionId: destination.id }, null, 'owner')
+        store.sessions.updateSessionMetadata(session.id, { supersededBySessionId: destination.id }, session.metadataVersion, 'owner')
+        const localId = kind === 'covered' ? coveredId : 'legacy-shared-local-id'
+        const accepted = store.addOriginMessage('owner', session.id, localId, destination.id, content, null, kind === 'covered')
+        const before = store.messages.getAllMessages(destination.id)
+        expect(() => store.addOriginMessage('owner', otherOrigin.id, localId, destination.id, { text: 'different origin intent' }, null, true)).toThrow('origin_conflict')
+        expect(() => store.addOriginMessage('owner', destination.id, localId, destination.id, { text: 'destination intent' }, null, true)).toThrow('origin_conflict')
+        expect(store.lookupOriginReceipt('owner', otherOrigin.id, localId).status).toBe(kind === 'covered' ? 'absent' : 'legacy-unknown')
+        expect(store.messages.getAllMessages(destination.id)).toEqual(before)
+        expect(store.lookupOriginReceipt('owner', session.id, localId)).toEqual(accepted.receipt)
+        expect(store.addOriginMessage('owner', session.id, localId, destination.id, { text: 'same-origin retry' }, null, true).delivery).toBeNull()
+    })
+
+    it('refuses ambiguous routed legacy backfill without receipt ownership', () => {
+        const { store, session } = fixture()
+        const destination = store.sessions.getOrCreateSession('legacy-destination', {}, null, 'owner')
+        const otherOrigin = store.sessions.getOrCreateSession('other-origin', { supersededBySessionId: destination.id }, null, 'owner')
+        store.sessions.updateSessionMetadata(session.id, { supersededBySessionId: destination.id }, session.metadataVersion, 'owner')
+        const localId = 'legacy-no-origin-proof'
+        const existing = store.messages.addMessage(destination.id, content, localId)
+        for (const origin of [session.id, otherOrigin.id]) {
+            expect(() => store.addOriginMessage('owner', origin, localId, destination.id, { text: 'unproven intent' }, null, true)).toThrow('origin_conflict')
+            expect(store.lookupOriginReceipt('owner', origin, localId).status).toBe('legacy-unknown')
+        }
+        expect(store.messages.getAllMessages(destination.id)).toEqual([existing])
+    })
+
+    it('refuses a covered ID found in a row without receipt provenance', () => {
+        const { store, session, localId } = fixture()
+        store.messages.addMessage(session.id, content, localId)
+        expect(() => insert(store, session.id, localId)).toThrow('origin_conflict')
+        expect(store.lookupOriginReceipt('owner', session.id, localId).status).toBe('absent')
+        expect(store.messages.getAllMessages(session.id)).toHaveLength(1)
+    })
+
     it('replacement move and origin deletion preserve receipts, routing, and new delivery destination', () => {
         const { store, session, localId } = fixture()
         const first = insert(store, session.id, localId)

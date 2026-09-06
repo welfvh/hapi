@@ -243,7 +243,14 @@ export class Store {
             if (previous.status === 'accepted') return { receipt: previous, delivery: null }
             const destination = this.resolveOriginSession(namespace, originalSessionId)
             if (destination !== expectedDestination) throw new OriginReceiptError('routing_changed')
-            const existing = this.db.prepare('SELECT 1 FROM messages WHERE session_id = ? AND local_id = ?').get(destination, localId)
+            const existing = this.db.prepare('SELECT id FROM messages WHERE session_id = ? AND local_id = ?')
+                .get(destination, localId) as { id: string } | undefined
+            if (existing) {
+                const owner = this.db.prepare('SELECT 1 FROM origin_message_receipts WHERE message_id = ? LIMIT 1').get(existing.id)
+                if (owner || originalSessionId !== destination || previous.status !== 'legacy-unknown') {
+                    throw new OriginReceiptError('origin_conflict')
+                }
+            }
             if (requireCovered && previous.status === 'legacy-unknown' && !existing) throw new OriginReceiptError('legacy_unknown')
             const delivery = this.addMessageForCurrentSession(destination, content, localId, scheduledAt)
             if (delivery.sessionId !== destination) throw new OriginReceiptError('routing_changed')

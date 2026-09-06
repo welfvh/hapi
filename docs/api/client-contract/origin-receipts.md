@@ -38,8 +38,12 @@ Non-accepted lookup returns `{version:1,status,originalSessionId,localId}`:
   safe through the transaction, not because lookup reserves absence.
 - `legacy-unknown`: no receipt and no provable post-migration ID provenance.
   No history scan or timestamp inference. Versioned POST refuses insertion with
-  HTTP 409 `legacy_unknown` unless a retained destination/local-ID row already
-  proves acceptance, in which case it atomically creates the receipt.
+  HTTP 409 `legacy_unknown` unless a retained row in the original session itself
+  proves acceptance and no receipt already attributes that row to another key.
+  Only that unclaimed, in-place legacy row can be backfilled. Shared-destination
+  collisions, routed legacy rows without origin proof, and covered IDs lacking
+  receipt provenance return HTTP 409 `origin_conflict`, never an acceptance for
+  another origin. Do not replace the local ID to evade a conflict.
 
 There is no server `sending` state: uncommitted transactions are not acceptance;
 client transport state remains separate. Errors/timeouts are never absence.
@@ -52,6 +56,8 @@ ACK. Do not use a capability from another hub/database to rewrite an outbox ID.
   existing-row deduplication, insertion and receipt. WAL uses synchronous FULL.
 - Accepted duplicate returns before active-session checks or delivery. New text,
   schedule or steer flags never change the original acceptance or emit again.
+  Verified legacy backfill persists its receipt, then takes the same no-delivery,
+  no-activity/SSE/thinking path; it does not revive an idle session.
   Explicit existing queue edit/steer APIs retain their separate semantics.
 - Merge persists the old-to-new route atomically with message moves. Routing
   validates each metadata/retained route hop in the insertion transaction;
