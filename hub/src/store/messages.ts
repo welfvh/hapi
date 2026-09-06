@@ -4,6 +4,7 @@ import { isDeepStrictEqual } from 'node:util'
 
 import type { StoredMessage } from './types'
 import { decodeMessageContent, encodeMessageContent, truncateOversizedMessageContent } from './contentCodec'
+import { recordOriginReplacement } from './originReceipts'
 
 type DbMessageRow = {
     id: string
@@ -1024,7 +1025,8 @@ export function mergeSessionMessages(
     const newMaxSeq = getMaxSeq(db, toSessionId)
 
     try {
-        db.exec('BEGIN')
+        db.exec('BEGIN IMMEDIATE')
+        recordOriginReplacement(db, fromSessionId, toSessionId)
 
         if (newMaxSeq > 0 && oldMaxSeq > 0) {
             db.prepare(

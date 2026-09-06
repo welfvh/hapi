@@ -14,6 +14,7 @@ import { UserStore } from './userStore'
 import { UsageStore } from './usageStore'
 import { WorkGraphStore } from './workGraphStore'
 import { GitHubIssueStore } from './githubIssueStore'
+import { createOriginReceiptSchema, getOriginReceiptCapability, lookupOriginReceipt, resolveOriginSession, recordOriginReplacement, OriginReceiptError, type OriginReceipt } from './originReceipts'
 
 export type {
     NativeDevicePlatform,
@@ -45,7 +46,7 @@ export {
     WorkGraphValidationError
 } from './workGraph'
 
-const SCHEMA_VERSION: number = 26
+const SCHEMA_VERSION: number = 27
 const REQUIRED_TABLES = [
     'sessions',
     'machines',
@@ -59,7 +60,10 @@ const REQUIRED_TABLES = [
     'usage_scan_state',
     'events',
     'event_links',
-    'github_issue_requests'
+    'github_issue_requests',
+    'origin_receipt_capability',
+    'origin_message_receipts',
+    'origin_session_routes'
 ] as const
 
 export class Store {
@@ -108,7 +112,7 @@ export class Store {
 
         this.db = new Database(dbPath, { create: true, readwrite: true, strict: true })
         this.db.exec('PRAGMA journal_mode = WAL')
-        this.db.exec('PRAGMA synchronous = NORMAL')
+        this.db.exec('PRAGMA synchronous = FULL')
         this.db.exec('PRAGMA foreign_keys = ON')
         this.db.exec('PRAGMA busy_timeout = 5000')
         this.initSchema()
@@ -203,6 +207,54 @@ export class Store {
             }
             return session.updatedAt
         })()
+    }
+
+    getOriginReceiptCapability() {
+        return getOriginReceiptCapability(this.db)
+    }
+
+    lookupOriginReceipt(namespace: string, originalSessionId: string, localId: string) {
+        return lookupOriginReceipt(this.db, namespace, originalSessionId, localId)
+    }
+
+    resolveOriginSession(namespace: string, originalSessionId: string) {
+        return resolveOriginSession(this.db, namespace, originalSessionId)
+    }
+
+    linkOriginReplacement(sessionId: string, destination: string, metadata: unknown, expectedVersion: number, namespace: string) {
+        return this.db.transaction(() => {
+            const result = this.sessions.updateSessionMetadata(sessionId, metadata, expectedVersion, namespace, { touchUpdatedAt: false })
+            if (result.result === 'success') recordOriginReplacement(this.db, sessionId, destination)
+            return result
+        }).immediate()
+    }
+
+    addOriginMessage(
+        namespace: string,
+        originalSessionId: string,
+        localId: string,
+        expectedDestination: string,
+        content: unknown,
+        scheduledAt?: number | null,
+        requireCovered = false
+    ): { receipt: OriginReceipt; delivery: { sessionId: string; message: StoredMessage; inserted: boolean } | null } {
+        return this.db.transaction(() => {
+            const previous = this.lookupOriginReceipt(namespace, originalSessionId, localId)
+            if (previous.status === 'accepted') return { receipt: previous, delivery: null }
+            const destination = this.resolveOriginSession(namespace, originalSessionId)
+            if (destination !== expectedDestination) throw new OriginReceiptError('routing_changed')
+            const existing = this.db.prepare('SELECT 1 FROM messages WHERE session_id = ? AND local_id = ?').get(destination, localId)
+            if (requireCovered && previous.status === 'legacy-unknown' && !existing) throw new OriginReceiptError('legacy_unknown')
+            const delivery = this.addMessageForCurrentSession(destination, content, localId, scheduledAt)
+            if (delivery.sessionId !== destination) throw new OriginReceiptError('routing_changed')
+            this.db.prepare(`INSERT INTO origin_message_receipts
+                (namespace, origin_session_id, local_id, message_id, accepted_at, resolved_session_id)
+                VALUES (?, ?, ?, ?, ?, ?)`)
+                .run(namespace, originalSessionId, localId, delivery.message.id, delivery.message.createdAt, destination)
+            const receipt = this.lookupOriginReceipt(namespace, originalSessionId, localId)
+            if (receipt.status !== 'accepted') throw new Error('Origin receipt insert failed')
+            return { receipt, delivery }
+        }).immediate()
     }
 
     /** Resolve a durable OpenCode clear reservation and insert in one SQLite transaction. */
@@ -354,6 +406,10 @@ export class Store {
             23: () => this.migrateFromV23ToV24(),
             24: () => this.migrateFromV24ToV25(),
             25: () => this.migrateFromV25ToV26(),
+            26: () => {
+                if (legacy) this.createSchema()
+                createOriginReceiptSchema(this.db)
+            },
         })
 
         if (currentVersion === 0) {
@@ -377,6 +433,7 @@ export class Store {
             }
 
             this.createSchema()
+            createOriginReceiptSchema(this.db)
             this.setUserVersion(SCHEMA_VERSION)
             return
         }

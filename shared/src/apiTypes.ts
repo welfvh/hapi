@@ -521,13 +521,43 @@ export type MessagesQuery = z.infer<typeof MessagesQuerySchema>
 export const MessageDeliveryModeSchema = z.enum(['queue', 'steer'])
 export type MessageDeliveryMode = z.infer<typeof MessageDeliveryModeSchema>
 
+export const OriginReceiptSchema = z.object({
+    version: z.literal(1),
+    status: z.literal('accepted'),
+    originalSessionId: z.string(),
+    localId: z.string(),
+    messageId: z.string(),
+    acceptedAt: z.number().int(),
+    resolvedSessionId: z.string(),
+    messageState: z.enum(['retained', 'deleted'])
+})
+export type OriginReceipt = z.infer<typeof OriginReceiptSchema>
+export const OriginReceiptLookupSchema = z.union([
+    OriginReceiptSchema,
+    z.object({
+        version: z.literal(1),
+        status: z.enum(['absent', 'legacy-unknown']),
+        originalSessionId: z.string(),
+        localId: z.string()
+    })
+])
+export type OriginReceiptLookup = z.infer<typeof OriginReceiptLookupSchema>
+export const OriginReceiptCapabilitySchema = z.object({
+    version: z.literal(1),
+    localIdPrefix: z.string()
+})
+
 export const SendMessageRequestSchema = z.object({
     text: z.string(),
+    originReceiptVersion: z.literal(1).optional(),
     localId: z.string().min(1).optional(),
     attachments: z.array(AttachmentMetadataSchema).optional(),
     scheduledAt: z.number().int().positive().nullable().optional(),
     deliveryMode: MessageDeliveryModeSchema.optional()
 }).refine(
+    (data) => data.originReceiptVersion === undefined || typeof data.localId === 'string',
+    { message: 'originReceiptVersion requires localId', path: ['localId'] }
+).refine(
     (data) => data.scheduledAt == null || typeof data.localId === 'string',
     { message: 'scheduledAt requires localId', path: ['localId'] }
 ).refine(

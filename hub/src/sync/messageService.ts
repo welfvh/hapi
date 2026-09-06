@@ -838,8 +838,10 @@ export class MessageService {
             sentFrom?: 'telegram-bot' | 'webapp'
             scheduledAt?: number | null
             deliveryMode?: MessageDeliveryMode
+            originNamespace?: string
+            originReceiptVersion?: 1
         }
-    ): Promise<{ actualSessionId: string; createdAt: number }> {
+    ): Promise<{ actualSessionId: string; createdAt: number; receipt?: import('../store/originReceipts').OriginReceipt; duplicate?: boolean }> {
         // Defence-in-depth invariant for non-REST callers (Telegram bot, MCP,
         // internal callers).  Attachment paths live under the CLI session's
         // upload directory which `cleanupUploadDir` purges on session end; a
@@ -852,9 +854,17 @@ export class MessageService {
             throw new Error('sendMessage: scheduled messages with attachments are not supported')
         }
 
+        const namespace = payload.originNamespace ?? this.store.sessions.getSession(sessionId)?.namespace
+        if (namespace && payload.localId) {
+            const previous = this.store.lookupOriginReceipt(namespace, sessionId, payload.localId)
+            if (previous.status === 'accepted') {
+                return { actualSessionId: previous.resolvedSessionId, createdAt: previous.acceptedAt, receipt: previous, duplicate: true }
+            }
+        }
+        const destination = namespace && payload.localId ? this.store.resolveOriginSession(namespace, sessionId) : sessionId
         const sentFrom = payload.sentFrom ?? 'webapp'
         const deliveryMode = getNormalizedDeliveryMode(
-            this.store.sessions.getSession(sessionId)?.metadata,
+            this.store.sessions.getSession(destination)?.metadata,
             payload.deliveryMode,
             payload.scheduledAt
         )
@@ -872,7 +882,13 @@ export class MessageService {
             }
         }
 
-        const inserted = this.store.addMessageForCurrentSession(
+        const admission = namespace && payload.localId ? this.store.addOriginMessage(
+            namespace, sessionId, payload.localId, destination, content, payload.scheduledAt, payload.originReceiptVersion === 1
+        ) : null
+        if (admission && !admission.delivery) {
+            return { actualSessionId: admission.receipt.resolvedSessionId, createdAt: admission.receipt.acceptedAt, receipt: admission.receipt, duplicate: true }
+        }
+        const inserted = admission?.delivery ?? this.store.addMessageForCurrentSession(
             sessionId,
             content,
             payload.localId ?? undefined,
@@ -941,7 +957,7 @@ export class MessageService {
                 ...(msg.deliveryState ? { deliveryState: msg.deliveryState } : {})
             }
         })
-        return { actualSessionId, createdAt: msg.createdAt }
+        return { actualSessionId, createdAt: msg.createdAt, ...(admission ? { receipt: admission.receipt } : {}) }
     }
 
     /**

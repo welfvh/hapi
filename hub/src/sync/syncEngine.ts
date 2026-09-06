@@ -994,6 +994,18 @@ export class SyncEngine {
         return this.machineCache.getOrCreateMachine(id, metadata, runnerState, namespace)
     }
 
+    getOriginReceiptCapability() {
+        return this.store.getOriginReceiptCapability()
+    }
+
+    lookupOriginReceipt(namespace: string, originalSessionId: string, localId: string) {
+        return this.store.lookupOriginReceipt(namespace, originalSessionId, localId)
+    }
+
+    resolveOriginSession(namespace: string, originalSessionId: string) {
+        return this.store.resolveOriginSession(namespace, originalSessionId)
+    }
+
     async sendMessage(
         sessionId: string,
         payload: {
@@ -1010,14 +1022,26 @@ export class SyncEngine {
             sentFrom?: 'telegram-bot' | 'webapp'
             scheduledAt?: number | null
             deliveryMode?: MessageDeliveryMode
+            originNamespace?: string
+            originReceiptVersion?: 1
         }
-    ): Promise<void> {
-        if (this.historyActionsInFlight.has(sessionId)) {
+    ): Promise<import('../store/originReceipts').OriginReceipt | undefined> {
+        if (payload.originNamespace && payload.localId) {
+            const previous = this.store.lookupOriginReceipt(payload.originNamespace, sessionId, payload.localId)
+            if (previous.status === 'accepted') return previous
+        }
+        const destination = payload.originNamespace && payload.localId
+            ? this.store.resolveOriginSession(payload.originNamespace, sessionId)
+            : sessionId
+        if (this.historyActionsInFlight.has(sessionId) || this.historyActionsInFlight.has(destination)) {
             throw new Error('Conversation history action already in progress')
         }
-        const { actualSessionId, createdAt: activeTurnStartedAt } = await this.messageService.sendMessage(sessionId, payload)
+        const result = await this.messageService.sendMessage(sessionId, payload)
+        if (result.duplicate) return result.receipt
+        const { actualSessionId, createdAt: activeTurnStartedAt } = result
         this.sessionCache.markMessageQueued(actualSessionId, Date.now(), activeTurnStartedAt)
         this.sessionCache.recordSessionActivity(actualSessionId, Date.now())
+        return result.receipt
     }
 
     async cancelQueuedMessage(
@@ -2350,11 +2374,10 @@ export class SyncEngine {
             const latest = this.sessionCache.getSessionByNamespace(sessionId, namespace)
                 ?? this.sessionCache.refreshSession(sessionId)
             if (!latest?.metadata) return false
-            if (latest.metadata.supersededBySessionId) {
-                return latest.metadata.supersededBySessionId === replacementSessionId
-            }
-            const result = this.store.sessions.updateSessionMetadata(
+            if (latest.metadata.supersededBySessionId && latest.metadata.supersededBySessionId !== replacementSessionId) return false
+            const result = this.store.linkOriginReplacement(
                 sessionId,
+                replacementSessionId,
                 {
                     ...latest.metadata,
                     supersededBySessionId: replacementSessionId,
@@ -2366,8 +2389,7 @@ export class SyncEngine {
                     }
                 },
                 latest.metadataVersion,
-                namespace,
-                { touchUpdatedAt: false }
+                namespace
             )
             if (result.result === 'success') {
                 this.sessionCache.refreshSession(sessionId)

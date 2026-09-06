@@ -2,10 +2,26 @@ import { Hono } from 'hono'
 import { MessagesQuerySchema, QueuedStateRequestSchema, SendMessageRequestSchema } from '@hapi/protocol'
 import type { SyncEngine } from '../../sync/syncEngine'
 import type { WebAppEnv } from '../middleware/auth'
-import { requireSessionFromParam, requireSyncEngine } from './guards'
+import { requireSession, requireSessionFromParam, requireSyncEngine } from './guards'
+import { OriginReceiptError } from '../../store/originReceipts'
 
 export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null): Hono<WebAppEnv> {
     const app = new Hono<WebAppEnv>()
+
+    app.get('/message-receipts/capability', (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+        return c.json(engine.getOriginReceiptCapability())
+    })
+
+    app.get('/message-receipts', (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+        const originalSessionId = c.req.query('originalSessionId')
+        const localId = c.req.query('localId')
+        if (!originalSessionId || !localId) return c.json({ error: 'originalSessionId and localId required' }, 400)
+        return c.json(engine.lookupOriginReceipt(c.get('namespace'), originalSessionId, localId))
+    })
 
     app.get('/sessions/:id/messages', async (c) => {
         const engine = requireSyncEngine(c, getSyncEngine)
@@ -124,12 +140,6 @@ export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null): Ho
             return engine
         }
 
-        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
-        if (sessionResult instanceof Response) {
-            return sessionResult
-        }
-        const sessionId = sessionResult.sessionId
-
         const body = await c.req.json().catch(() => null)
         const parsed = SendMessageRequestSchema.safeParse(body)
         if (!parsed.success) {
@@ -141,15 +151,33 @@ export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null): Ho
             return c.json({ error: 'Message requires text or attachments' }, 400)
         }
 
-        await engine.sendMessage(sessionId, {
-            text: parsed.data.text,
-            localId: parsed.data.localId,
-            attachments: parsed.data.attachments,
-            sentFrom: 'webapp',
-            scheduledAt: parsed.data.scheduledAt,
-            deliveryMode: parsed.data.deliveryMode
-        })
-        return c.json({ ok: true })
+        const sessionId = c.req.param('id')
+        const namespace = c.get('namespace')
+        try {
+            let destination = sessionId
+            if (parsed.data.localId) {
+                const previous = engine.lookupOriginReceipt(namespace, sessionId, parsed.data.localId)
+                if (previous.status === 'accepted') return c.json({ ok: true, receipt: previous })
+                destination = engine.resolveOriginSession(namespace, sessionId)
+            }
+            const sessionResult = requireSession(c, engine, destination, { requireActive: true })
+            if (sessionResult instanceof Response) return sessionResult
+
+            const receipt = await engine.sendMessage(sessionId, {
+                text: parsed.data.text,
+                localId: parsed.data.localId,
+                attachments: parsed.data.attachments,
+                sentFrom: 'webapp',
+                scheduledAt: parsed.data.scheduledAt,
+                deliveryMode: parsed.data.deliveryMode,
+                originNamespace: namespace,
+                originReceiptVersion: parsed.data.originReceiptVersion
+            })
+            return c.json({ ok: true, ...(receipt ? { receipt } : {}) })
+        } catch (error) {
+            if (error instanceof OriginReceiptError) return c.json({ error: error.code, code: error.code }, 409)
+            throw error
+        }
     })
 
     return app

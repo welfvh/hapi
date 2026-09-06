@@ -198,7 +198,7 @@ describe('SyncEngine.clearOpenCodeSession', () => {
             engine.subscribe((event) => events.push(event))
 
             await expect(engine.sendMessage(source.id, { text: 'must not cross namespace', localId: 'forged-local' })).rejects.toThrow(
-                'redirect target is unavailable'
+                'origin_unavailable'
             )
 
             expect(store.messages.getAllMessages(source.id)).toEqual([])
@@ -725,6 +725,34 @@ describe('SyncEngine.clearOpenCodeSession', () => {
             expect(spawnSession).not.toHaveBeenCalled()
         } finally {
             engine.stop()
+        }
+    })
+
+    it('keeps exact origin receipt and finalized clear routing after deleting the archived source', async () => {
+        const { store, engine } = createEngine()
+        try {
+            const source = createClearSource(engine)
+            const localId = store.getOriginReceiptCapability().localIdPrefix + crypto.randomUUID()
+            const accepted = await engine.sendMessage(source.id, {
+                text: 'synthetic scheduled receipt', localId, scheduledAt: Date.now() + 60000,
+                originNamespace: 'default', originReceiptVersion: 1
+            })
+            expect(accepted?.status).toBe('accepted')
+            if (!accepted) throw new Error('expected an origin receipt')
+            setSpawn(engine, mock(async (...args: unknown[]) => ({ type: 'success' as const, sessionId: args[12] as string })))
+            const result = await engine.clearOpenCodeSession(source.id, 'default')
+            if (result.type !== 'success') throw new Error('expected successful clear')
+            store.sessions.deleteSession(source.id, 'default')
+            expect(store.resolveOriginSession('default', source.id)).toBe(result.sessionId)
+            const duplicate = await engine.sendMessage(source.id, {
+                text: 'different duplicate', localId, deliveryMode: 'steer',
+                originNamespace: 'default', originReceiptVersion: 1
+            })
+            expect(duplicate).toEqual({ ...accepted, resolvedSessionId: result.sessionId })
+            expect(store.messages.getAllMessages(result.sessionId)).toHaveLength(1)
+        } finally {
+            engine.stop()
+            store.close()
         }
     })
 

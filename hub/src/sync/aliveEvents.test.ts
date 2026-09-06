@@ -249,7 +249,7 @@ describe('alive incremental events', () => {
         expect(events.find((event) => event.type === 'session-updated')).toBeUndefined()
     })
 
-    it('starts a fresh grace window when an old local message is retried', async () => {
+    it('does not start a new thinking grace window for an accepted duplicate', async () => {
         const store = new Store(':memory:')
         const io = {
             of: () => ({
@@ -277,18 +277,18 @@ describe('alive incremental events', () => {
             Date.now = () => now - 20_000
             engine.handleSessionAlive({ sid: session.id, time: now - 20_000, thinking: false })
             await engine.sendMessage(session.id, { text: 'retry me', localId: 'stable-local-id' })
-            const storedTurnStartedAt = engine.getSession(session.id)?.activeTurnStartedAt
+            expect(engine.getSession(session.id)?.activeTurnStartedAt).not.toBeNull()
 
             Date.now = () => now
             engine.handleSessionAlive({ sid: session.id, time: now, thinking: false })
             expect(engine.getSession(session.id)?.thinking).toBe(false)
 
             await engine.sendMessage(session.id, { text: 'retry me', localId: 'stable-local-id' })
-            expect(engine.getSession(session.id)?.activeTurnStartedAt).toBe(storedTurnStartedAt)
+            expect(engine.getSession(session.id)?.activeTurnStartedAt).toBeNull()
 
             Date.now = () => now + 1_000
             engine.handleSessionAlive({ sid: session.id, time: now + 1_000, thinking: false })
-            expect(engine.getSession(session.id)?.thinking).toBe(true)
+            expect(engine.getSession(session.id)?.thinking).toBe(false)
         } finally {
             Date.now = originalNow
             engine.stop()

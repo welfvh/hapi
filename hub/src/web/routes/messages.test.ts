@@ -64,6 +64,8 @@ function createApp(opts: {
     }))
 
     const engine = {
+        lookupOriginReceipt: () => ({ version: 1, status: 'legacy-unknown' }),
+        resolveOriginSession: (_namespace: string, sessionId: string) => sessionId,
         resolveSessionAccess: () => ({
             ok: true,
             sessionId: 'session-1',
@@ -282,7 +284,9 @@ describe('POST /api/sessions/:id/messages — deliveryMode', () => {
                 attachments: undefined,
                 sentFrom: 'webapp',
                 scheduledAt: undefined,
-                deliveryMode: 'steer'
+                deliveryMode: 'steer',
+                originNamespace: 'default',
+                originReceiptVersion: undefined
             }
         }])
     })
