@@ -84,10 +84,36 @@ describe('permanent origin receipts', () => {
         const localId = 'legacy-no-origin-proof'
         const existing = store.messages.addMessage(destination.id, content, localId)
         for (const origin of [session.id, otherOrigin.id]) {
-            expect(() => store.addOriginMessage('owner', origin, localId, destination.id, { text: 'unproven intent' }, null, true)).toThrow('origin_conflict')
+            expect(() => store.addOriginMessage('owner', origin, localId, destination.id, { text: 'unproven intent' }, null, true)).toThrow('legacy_unknown')
             expect(store.lookupOriginReceipt('owner', origin, localId).status).toBe('legacy-unknown')
         }
         expect(store.messages.getAllMessages(destination.id)).toEqual([existing])
+    })
+
+    it.each(['before-migration', 'after-migration'] as const)('does not invent destination origin after an unreceipted legacy move %s', timing => {
+        const { store, path, session } = fixture()
+        const destination = store.sessions.getOrCreateSession('destination', {}, null, 'owner')
+        const localId = 'legacy-origin-not-recorded'
+        store.messages.addMessage(session.id, content, localId)
+        let current = store
+        if (timing === 'before-migration') {
+            store.close()
+            const db = new Database(path)
+            db.exec('DROP TRIGGER origin_session_deleted; DROP TRIGGER origin_message_moved; DROP TABLE origin_message_receipts; DROP TABLE origin_session_routes; DROP TABLE origin_receipt_capability; PRAGMA user_version=26')
+            db.prepare('UPDATE messages SET session_id = ? WHERE session_id = ?').run(destination.id, session.id)
+            db.close()
+            current = new Store(path)
+            stores.push(current)
+        } else {
+            store.messages.mergeSessionMessages(session.id, destination.id)
+        }
+        const before = current.messages.getAllMessages(destination.id)
+        expect(() => current.addOriginMessage('owner', destination.id, localId, destination.id, { text: 'different destination intent' }, null, true)).toThrow('legacy_unknown')
+        expect(current.lookupOriginReceipt('owner', destination.id, localId).status).toBe('legacy-unknown')
+        expect(current.lookupOriginReceipt('owner', session.id, localId).status).toBe('legacy-unknown')
+        expect(current.messages.getAllMessages(destination.id)).toEqual(before)
+        expect(before).toHaveLength(1)
+        expect(before[0].content).toEqual(content)
     })
 
     it('refuses a covered ID found in a row without receipt provenance', () => {
@@ -136,8 +162,9 @@ describe('permanent origin receipts', () => {
         stores.push(upgraded)
         expect(upgraded.lookupOriginReceipt('owner', session.id, 'missing-legacy').status).toBe('legacy-unknown')
         expect(() => insert(upgraded, session.id, 'missing-legacy')).toThrow('legacy_unknown')
-        expect(insert(upgraded, session.id, 'existing-legacy').delivery?.inserted).toBe(false)
-        expect(upgraded.lookupOriginReceipt('owner', session.id, 'existing-legacy').status).toBe('accepted')
+        expect(() => insert(upgraded, session.id, 'existing-legacy')).toThrow('legacy_unknown')
+        expect(upgraded.lookupOriginReceipt('owner', session.id, 'existing-legacy').status).toBe('legacy-unknown')
+        expect(upgraded.messages.getAllMessages(session.id)).toHaveLength(1)
         const prefix = upgraded.getOriginReceiptCapability().localIdPrefix
         expect(upgraded.lookupOriginReceipt('owner', session.id, prefix + randomUUID()).status).toBe('absent')
         expect(upgraded.lookupOriginReceipt('owner', session.id, prefix + 'invalid').status).toBe('legacy-unknown')

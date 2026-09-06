@@ -249,7 +249,7 @@ describe('alive incremental events', () => {
         expect(events.find((event) => event.type === 'session-updated')).toBeUndefined()
     })
 
-    it.each([null, 60_000])('legacy receipt backfill with schedule offset %s has no delivery, activity, SSE or thinking side effects', async offset => {
+    it.each([null, 60_000])('unproven legacy receipt retry with schedule offset %s has no delivery, activity, SSE or thinking side effects', async offset => {
         const store = new Store(':memory:')
         const emitted: unknown[] = []
         const broadcasts: unknown[] = []
@@ -279,14 +279,11 @@ describe('alive incremental events', () => {
             broadcasts.length = 0
             events.length = 0
             Date.now = () => now + 1000
-            const receipt = await engine.sendMessage(session.id, {
+            await expect(engine.sendMessage(session.id, {
                 text: 'retry cannot mutate original', localId, deliveryMode: 'steer',
                 originNamespace: 'default', originReceiptVersion: 1
-            })
-            expect(receipt?.messageId).toBe(message.id)
-            expect(receipt?.status).toBe('accepted')
-            if (!receipt) throw new Error('expected a persisted receipt')
-            expect(store.lookupOriginReceipt('default', session.id, localId)).toEqual(receipt)
+            })).rejects.toThrow('legacy_unknown')
+            expect(store.lookupOriginReceipt('default', session.id, localId).status).toBe('legacy-unknown')
             expect(store.messages.getAllMessages(session.id)).toEqual([message])
             expect(engine.getSession(session.id)).toEqual(before)
             expect(store.sessions.getSession(session.id)).toEqual(storedBefore)

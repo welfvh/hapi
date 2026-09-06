@@ -247,11 +247,9 @@ export class Store {
                 .get(destination, localId) as { id: string } | undefined
             if (existing) {
                 const owner = this.db.prepare('SELECT 1 FROM origin_message_receipts WHERE message_id = ? LIMIT 1').get(existing.id)
-                if (owner || originalSessionId !== destination || previous.status !== 'legacy-unknown') {
-                    throw new OriginReceiptError('origin_conflict')
-                }
+                throw new OriginReceiptError(owner || previous.status !== 'legacy-unknown' ? 'origin_conflict' : 'legacy_unknown')
             }
-            if (requireCovered && previous.status === 'legacy-unknown' && !existing) throw new OriginReceiptError('legacy_unknown')
+            if (requireCovered && previous.status === 'legacy-unknown') throw new OriginReceiptError('legacy_unknown')
             const delivery = this.addMessageForCurrentSession(destination, content, localId, scheduledAt)
             if (delivery.sessionId !== destination) throw new OriginReceiptError('routing_changed')
             this.db.prepare(`INSERT INTO origin_message_receipts
