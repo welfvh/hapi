@@ -281,6 +281,7 @@ export interface ClientToServerEvents {
   /** CLI agent finished session/load (or equivalent) and can accept prompts. */
     'session-ready': (data: { sid: string; time: number }) => void
     'session-end': (data: { sid: string; time: number; reason?: SessionEndReason }) => void
+    'messages-buffered': (data: { sid: string; localIds: string[] }) => void
     'messages-consumed': (data: { sid: string; localIds: string[]; clearQueuedThinkingGrace?: boolean; steered?: boolean }) => void
     'messages-indeterminate': (data: { sid: string; localIds: string[] }) => void
     'messages-steer-state': (data: { sid: string; localIds: string[]; state: 'queued' | 'dispatching' }, cb: (response: { ok: boolean }) => void) => void

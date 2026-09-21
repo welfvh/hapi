@@ -52,4 +52,17 @@ describe('reserved queue reorder', () => {
         expect((await q.waitForMessagesAndGetAsString())?.items.map(item => item.localId)).toEqual(['c'])
     })
 
+    it('publishes snapshots after enqueue, reservation, restore, cancel and consumption', async () => {
+        const q = new MessageQueue2<string>(mode => mode)
+        const snapshots: string[][] = []
+        q.onPendingChanged = () => snapshots.push(q.pendingLocalIds())
+        q.push('A', 'same', 'a')
+        q.push('B', 'same', 'b')
+        const held = q.takeByLocalId('b')!
+        q.restoreReservation(held)
+        q.cancelByLocalId('b')
+        await q.waitForMessagesAndGetAsString()
+        expect(snapshots).toEqual([['a'], ['a', 'b'], ['a'], ['a', 'b'], ['a'], []])
+    })
+
 })

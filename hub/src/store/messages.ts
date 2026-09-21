@@ -1,3 +1,4 @@
+import { isLiveQueued } from './liveQueue'
 import type { Database } from 'bun:sqlite'
 import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
@@ -92,7 +93,7 @@ function toStoredMessage(row: DbMessageRow): StoredMessage {
         invokedAt: row.invoked_at ?? null,
         scheduledAt: row.scheduled_at ?? null,
         queueOrder: row.queue_order ?? row.seq,
-        ...(row.delivery_state && row.delivery_state !== 'queued' ? { deliveryState: 'indeterminate' as const } : {})
+        ...(row.delivery_state && row.delivery_state !== 'queued' && !(row.delivery_state === 'dispatching' && isLiveQueued(row.session_id, row.local_id)) ? { deliveryState: 'indeterminate' as const } : {})
     }
 }
 
@@ -525,7 +526,7 @@ export function getLocalMessageStates(
         localId: row.local_id,
         invokedAt: row.invoked_at,
         ...(row.delivery_state && row.delivery_state !== 'queued'
-            ? { deliveryState: row.delivery_state }
+            ? { deliveryState: row.delivery_state === 'dispatching' && isLiveQueued(sessionId, row.local_id) ? 'buffered' : row.delivery_state }
             : {})
     }))
 }

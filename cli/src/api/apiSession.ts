@@ -245,6 +245,7 @@ export class ApiSessionClient extends EventEmitter {
     private reorderQueuedMessageCallbacks: {
         prepare: (id: string, leftId: string, rightId: string) => boolean;
         settle: (id: string, committed: boolean) => boolean;
+        pending?: () => string[];
     } | null = null
     private readonly reconcilingQueueMoves = new Set<string>()
     private retryQueuedMessageCallback: ((localId: string) => boolean) | null = null
@@ -332,6 +333,7 @@ export class ApiSessionClient extends EventEmitter {
 
         this.socket.on('connect', () => {
             logger.debug('Socket connected successfully')
+            this.emitQueuedMessages()
             this.awaitingMaterializedConnection = false
             this.rpcHandlerManager.onSocketConnect(this.socket)
             if (this.hasConnectedOnce) {
@@ -716,7 +718,18 @@ export class ApiSessionClient extends EventEmitter {
     onReorderQueuedMessage(callbacks: {
         prepare: (id: string, leftId: string, rightId: string) => boolean;
         settle: (id: string, committed: boolean) => boolean;
-    }): void { this.reorderQueuedMessageCallbacks = callbacks }
+        pending?: () => string[];
+    }): void {
+        this.reorderQueuedMessageCallbacks = callbacks
+        this.emitQueuedMessages()
+    }
+
+    emitQueuedMessages(): void {
+        // Never replay a stale snapshot accumulated while disconnected.
+        if (!this.socket.connected) return
+        const localIds = this.reorderQueuedMessageCallbacks?.pending?.()
+        if (localIds) this.socket.emit('messages-buffered', { sid: this.sessionId, localIds })
+    }
 
     private async reconcileQueueMove(id: string): Promise<void> {
         if (this.reconcilingQueueMoves.has(id)) return

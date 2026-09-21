@@ -30,6 +30,7 @@ export class MessageQueue2<T> {
     private waiter: ((hasMessages: boolean) => void) | null = null;
     private closed = false;
     private onMessageHandler: ((message: string, mode: T) => void) | null = null;
+    onPendingChanged: (() => void) | null = null;
     onBatchConsumed: ((localIds: string[]) => void) | null = null;
     modeHasher: (mode: T) => string;
     private readonly reservations = new Map<string, QueueReservation<T>>();
@@ -71,6 +72,7 @@ export class MessageQueue2<T> {
         this.completedReorders.add(id);
         if (this.completedReorders.size > 256) this.completedReorders.delete(this.completedReorders.values().next().value!);
         for (const action of hold.after) action();
+        this.onPendingChanged?.();
         hold.release();
         return true;
     }
@@ -126,6 +128,7 @@ export class MessageQueue2<T> {
         };
         Object.defineProperty(item, 'enqueueOrder', { value: item.enqueueOrder, enumerable: false, writable: true });
         this.queue.push(item);
+        this.onPendingChanged?.();
 
         // Trigger message handler if set
         if (this.onMessageHandler) {
@@ -165,6 +168,7 @@ export class MessageQueue2<T> {
         };
         Object.defineProperty(item, 'enqueueOrder', { value: item.enqueueOrder, enumerable: false, writable: true });
         this.queue.push(item);
+        this.onPendingChanged?.();
 
         // Trigger message handler if set
         if (this.onMessageHandler) {
@@ -207,6 +211,7 @@ export class MessageQueue2<T> {
         };
         Object.defineProperty(item, 'enqueueOrder', { value: item.enqueueOrder, enumerable: false, writable: true });
         this.queue.push(item);
+        this.onPendingChanged?.();
 
         if (this.onMessageHandler) {
             this.onMessageHandler(message, mode);
@@ -258,6 +263,7 @@ export class MessageQueue2<T> {
         };
         Object.defineProperty(item, 'enqueueOrder', { value: item.enqueueOrder, enumerable: false, writable: true });
         this.queue.push(item);
+        this.onPendingChanged?.();
 
         // Trigger message handler if set
         if (this.onMessageHandler) {
@@ -296,6 +302,7 @@ export class MessageQueue2<T> {
         };
         Object.defineProperty(item, 'enqueueOrder', { value: item.enqueueOrder, enumerable: false, writable: true });
         this.queue.unshift(item);
+        this.onPendingChanged?.();
 
         // Trigger message handler if set
         if (this.onMessageHandler) {
@@ -338,6 +345,7 @@ export class MessageQueue2<T> {
         };
         Object.defineProperty(item, 'enqueueOrder', { value: item.enqueueOrder, enumerable: false, writable: true });
         this.queue.unshift(item);
+        this.onPendingChanged?.();
 
         if (this.onMessageHandler) {
             this.onMessageHandler(message, mode);
@@ -364,6 +372,7 @@ export class MessageQueue2<T> {
         const idx = this.queue.findIndex(item => item.localId === localId);
         if (idx !== -1) {
             this.queue.splice(idx, 1);
+            this.onPendingChanged?.();
             return true;
         }
         const reservation = this.reservations.get(localId);
@@ -420,6 +429,7 @@ export class MessageQueue2<T> {
         const idx = this.queue.findIndex(item => item.localId === localId);
         if (idx === -1) return null;
         const [item] = this.queue.splice(idx, 1);
+        this.onPendingChanged?.();
         if (!item) return null;
         const reservation: QueueReservation<T> = {
             item,
@@ -474,6 +484,7 @@ export class MessageQueue2<T> {
                     ? previousIndex + 1
                     : this.queue.length;
         this.queue.splice(idx, 0, reservation.item);
+        this.onPendingChanged?.();
         if (this.waiter) {
             const waiter = this.waiter;
             this.waiter = null;
@@ -572,6 +583,7 @@ export class MessageQueue2<T> {
         }
         logger.debug(`[MessageQueue2] reset() called. Clearing ${this.queue.length} messages`);
         this.queue = [];
+        this.onPendingChanged?.();
         this.cancelReservations(options?.preserveDispatchingReservations === true);
         this.closed = false;
 
@@ -688,6 +700,7 @@ export class MessageQueue2<T> {
             logger.debug(`[MessageQueue2] Collected batch of ${sameModeMessages.length} messages with mode hash: ${targetModeHash}`);
         }
 
+        this.onPendingChanged?.();
         // Join all messages with newlines
         const combinedMessage = sameModeMessages.join('\n');
 

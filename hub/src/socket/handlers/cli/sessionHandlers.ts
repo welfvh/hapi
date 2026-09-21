@@ -1,3 +1,4 @@
+import { recordLiveQueue, forgetLiveQueueOwner, isLiveQueued } from '../../../store/liveQueue'
 import type { ClientToServerEvents } from '@hapi/protocol'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
@@ -362,6 +363,35 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             return
         }
         onSessionReady?.(data)
+    })
+
+    socket.on('messages-buffered', (data: { sid: string; localIds: string[] }) => {
+        if (!data || typeof data.sid !== 'string' || !Array.isArray(data.localIds)
+            || data.localIds.length > 10_000 || data.localIds.some(id => typeof id !== 'string')) return
+        const access = resolveSessionAccess(data.sid)
+        if (!access.ok) return
+        const roomName = `session:${data.sid}`
+        const live = () => {
+            const owners = socket.nsp.adapter.rooms.get(roomName)
+            return socket.connected && owners?.size === 1 && owners.has(socket.id)
+        }
+        if (!live()) return
+        const previous = store.messages.getUninvokedLocalMessages(data.sid)
+        recordLiveQueue(data.sid, socket.id, data.localIds, live)
+        const confirmed = previous.filter(row => row.localId && isLiveQueued(data.sid, row.localId))
+            .map(row => row.localId!)
+        // Requeued is a client projection update, not permission to replay a
+        // durable dispatch claim. Explicit indeterminate rows remain unknown.
+        const safe = store.messages.getLocalMessageStates(data.sid, confirmed)
+            .filter(row => row.invokedAt === null && row.deliveryState === 'buffered').map(row => row.localId)
+        if (safe.length) onWebappEvent?.({ type: 'messages-requeued', sessionId: data.sid, localIds: safe })
+    })
+    socket.on('disconnect', () => {
+        for (const queue of forgetLiveQueueOwner(socket.id)) {
+            const unknown = store.messages.getLocalMessageStates(queue.sessionId, queue.localIds)
+                .filter(row => row.invokedAt === null && row.deliveryState === 'dispatching').map(row => row.localId)
+            if (unknown.length) onWebappEvent?.({ type: 'messages-indeterminate', sessionId: queue.sessionId, localIds: unknown })
+        }
     })
 
     socket.on('messages-consumed', (data: { sid: string; localIds: string[]; clearQueuedThinkingGrace?: boolean; steered?: boolean }) => {

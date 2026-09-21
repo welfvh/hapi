@@ -107,9 +107,11 @@ export async function runCursor(opts: {
         enqueueCursorUserMessage(messageQueue, formattedText, enhancedMode, localId);
     });
 
+    messageQueue.onPendingChanged = () => session.emitQueuedMessages();
     session.onReorderQueuedMessage({
         prepare: (id, leftId, rightId) => messageQueue.prepareReorder(id, leftId, rightId),
         settle: (id, committed) => messageQueue.settleReorder(id, committed),
+        pending: () => messageQueue.pendingLocalIds(),
     });
 
     session.onCancelQueuedMessage((localId) => {
