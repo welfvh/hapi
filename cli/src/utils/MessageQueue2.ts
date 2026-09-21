@@ -404,6 +404,7 @@ export class MessageQueue2<T> {
      * operation may need to put the item back in order.
      */
     takeByLocalId(localId: string): QueueReservation<T> | null {
+        if (this.reorderHold) return null;
         if (!localId) return null;
 
         // An indeterminate steer is deliberately held outside the normal queue.
