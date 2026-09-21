@@ -368,6 +368,56 @@ describe('buildCliArgs', () => {
 
 
 describe('createSpawnDeduplicator', () => {
+    it('replaces an exited adopted generation immediately and coalesces concurrent reopen', async () => {
+        let calls = 0
+        let checks = 0
+        let finishProbe!: (value: 'exited') => void
+        const dedupe = createSpawnDeduplicator(async () => {
+            calls += 1
+            return { type: 'success' as const, sessionId: 'stable-session' }
+        }, async () => {
+            checks += 1
+            return await new Promise<'exited'>(resolve => { finishProbe = resolve })
+        })
+        dedupe.recoverChild('stable-session', { type: 'success', sessionId: 'stable-session' })
+        const options = { directory: '/tmp', existingSessionId: 'stable-session' }
+        const first = dedupe(options)
+        const concurrent = dedupe(options)
+        // The old wrapper exits during the request's bounded generation probe.
+        finishProbe('exited')
+        await expect(first).resolves.toEqual({ type: 'success', sessionId: 'stable-session' })
+        await expect(concurrent).resolves.toEqual({ type: 'success', sessionId: 'stable-session' })
+        expect(checks).toBe(1)
+        expect(calls).toBe(1)
+        await dedupe(options)
+        expect(calls).toBe(1)
+    })
+
+    it('does not duplicate a verified live adopted wrapper', async () => {
+        let calls = 0
+        const dedupe = createSpawnDeduplicator(async () => {
+            calls += 1
+            return { type: 'success' as const, sessionId: 'duplicate' }
+        }, async () => 'verified')
+        dedupe.recoverChild('stable-session', { type: 'success', sessionId: 'stable-session' })
+        await expect(dedupe({ directory: '/tmp', existingSessionId: 'stable-session' })).resolves.toEqual({
+            type: 'success', sessionId: 'stable-session'
+        })
+        expect(calls).toBe(0)
+    })
+
+    it('never reports recovered success when the process generation cannot be verified', async () => {
+        let calls = 0
+        const dedupe = createSpawnDeduplicator(async () => {
+            calls += 1
+            return { type: 'success' as const, sessionId: 'duplicate' }
+        }, async () => 'unknown')
+        dedupe.recoverChild('stable-session', { type: 'success', sessionId: 'stable-session' })
+        const result = await dedupe({ directory: '/tmp', existingSessionId: 'stable-session' })
+        expect(result.type).toBe('error')
+        expect(calls).toBe(0)
+    })
+
     it('rehydrates a live child after runner restart without spawning again', async () => {
         let calls = 0
         const dedupe = createSpawnDeduplicator(async () => {

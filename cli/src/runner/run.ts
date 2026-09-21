@@ -44,15 +44,40 @@ export type SpawnDeduplicator = ((options: SpawnSessionOptions) => Promise<Spawn
 }
 
 export function createSpawnDeduplicator(
-  spawnOnce: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>
+  spawnOnce: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>,
+  verifyRecovered?: (sessionId: string) => Promise<'verified' | 'exited' | 'unknown'>
 ): SpawnDeduplicator {
   const completedOrInFlight = new Map<string, Promise<SpawnSessionResult>>();
   const childState = new Map<string, 'alive' | 'stopping'>();
+  const recovered = new Set<string>();
+  const verifications = new Map<string, Promise<'verified' | 'exited' | 'unknown'>>();
 
   const dedupe = async (options: SpawnSessionOptions): Promise<SpawnSessionResult> => {
     const key = options.existingSessionId;
     if (!key) {
       return await spawnOnce(options);
+    }
+    const recoveredResult = completedOrInFlight.get(key);
+    if (recoveredResult && recovered.has(key) && verifyRecovered) {
+      let verification = verifications.get(key);
+      if (!verification) {
+        verification = verifyRecovered(key);
+        verifications.set(key, verification);
+      }
+      let generation: 'verified' | 'exited' | 'unknown';
+      try {
+        generation = await verification;
+      } finally {
+        if (verifications.get(key) === verification) verifications.delete(key);
+      }
+      // A heartbeat or another request may already have replaced this result.
+      // Never invalidate a newly spawned generation with an older probe.
+      if (completedOrInFlight.get(key) === recoveredResult) {
+        if (generation === 'unknown') {
+          return { type: 'error', errorMessage: `Session ${key} process verification is pending` };
+        }
+        if (generation === 'exited') dedupe.onChildExited(key);
+      }
     }
     const existing = completedOrInFlight.get(key);
     if (existing) {
@@ -76,6 +101,7 @@ export function createSpawnDeduplicator(
     return await task;
   };
   dedupe.recoverChild = (existingSessionId: string, result: SpawnSessionResult) => {
+    recovered.add(existingSessionId);
     childState.set(existingSessionId, 'alive');
     completedOrInFlight.set(existingSessionId, Promise.resolve(result));
   };
@@ -88,6 +114,7 @@ export function createSpawnDeduplicator(
     }
   };
   dedupe.onChildExited = (existingSessionId: string) => {
+    recovered.delete(existingSessionId);
     childState.delete(existingSessionId);
     completedOrInFlight.delete(existingSessionId);
   };
@@ -893,7 +920,35 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
       }
     };
 
-    spawnSession = createSpawnDeduplicator(spawnSessionOnce);
+    spawnSession = createSpawnDeduplicator(spawnSessionOnce, async (sessionId) => {
+      // Adopted wrappers have no ChildProcess exit callback. Do not wait for
+      // the 60s heartbeat to invalidate success after an archive closes one.
+      const records = [...persistedResumeProcesses.values()].filter(
+        record => record.requestedSessionId === sessionId
+      );
+      if (records.length === 0) return 'unknown';
+      const deadline = Date.now() + 2_000;
+      while (true) {
+        let live = false;
+        for (const record of records) {
+          const alive = isProcessAlive(record.pid);
+          const generation = classifyRecoveredProcessGeneration(
+            alive, alive ? getProcessStartMarker(record.pid) : null, record.processStartMarker
+          );
+          if (generation === 'quarantined') return 'unknown';
+          if (generation === 'verified') live = true;
+        }
+        if (!live) {
+          for (const record of records) onChildExited(record.pid);
+          return 'exited';
+        }
+        // Archive may have signalled an adopted wrapper immediately before
+        // reopen. Give that exact generation a bounded opportunity to exit;
+        // never terminate it or spawn a concurrent native resume.
+        if (Date.now() >= deadline) return 'verified';
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    });
     for (const [pid, record] of persistedResumeProcesses) {
       const verified = pidToRequestedSessionId.get(pid) === record.requestedSessionId;
       existingSessionIdByChildPid.set(pid, record.requestedSessionId);
