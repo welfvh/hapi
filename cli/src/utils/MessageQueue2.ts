@@ -558,7 +558,17 @@ export class MessageQueue2<T> {
      * Reset the queue - clears all messages and resets to empty state
      */
     reset(options?: { preserveDispatchingReservations?: boolean }): void {
-        if (this.reorderHold) throw new Error('Queue order is awaiting reconciliation; reset is unavailable');
+        if (this.reorderHold) {
+            // Abort/reset intent applies to the inputs present now. Defer their
+            // removal until the durable order decision, preserving newer input.
+            const discarded = new Set(this.queue);
+            this.reorderHold.after.push(() => {
+                this.queue = this.queue.filter(item => !discarded.has(item));
+                this.cancelReservations(options?.preserveDispatchingReservations === true);
+                this.closed = false;
+            });
+            return;
+        }
         logger.debug(`[MessageQueue2] reset() called. Clearing ${this.queue.length} messages`);
         this.queue = [];
         this.cancelReservations(options?.preserveDispatchingReservations === true);

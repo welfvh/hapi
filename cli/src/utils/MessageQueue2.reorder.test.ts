@@ -43,4 +43,13 @@ describe('reserved queue reorder', () => {
         expect(q.prepareReorder('move', 'a', 'b')).toBe(false)
         expect(q.pendingLocalIds()).toEqual(['b', 'c'])
     })
+    it('defers reset across the reservation without discarding newer input', async () => {
+        const q = queue()
+        q.prepareReorder('move', 'a', 'b')
+        q.reset()
+        q.push('C', 'same', 'c')
+        expect(q.settleReorder('move', true)).toBe(true)
+        expect((await q.waitForMessagesAndGetAsString())?.items.map(item => item.localId)).toEqual(['c'])
+    })
+
 })
