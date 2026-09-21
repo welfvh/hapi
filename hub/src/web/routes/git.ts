@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { historicalAttachment, historicalGeneratedImage } from '../../storage/historicalSessionMedia'
 import { isWildcardSearch, matchesSearchQuery, toSearchGlob } from '@hapi/protocol'
 import { z } from 'zod'
 import type { SyncEngine } from '../../sync/syncEngine'
@@ -154,7 +155,8 @@ export function createGitRoutes(getSyncEngine: () => SyncEngine | null): Hono<We
             return c.json({ error: 'Invalid file path' }, 400)
         }
 
-        const result = await runRpc(() => engine.readSessionFile(sessionResult.sessionId, parsed.data.path))
+        const local = await historicalAttachment(engine, sessionResult.session, parsed.data.path)
+        const result = local ?? await runRpc(() => engine.readSessionFile(sessionResult.sessionId, parsed.data.path))
         return c.json(result)
     })
 
@@ -185,7 +187,8 @@ export function createGitRoutes(getSyncEngine: () => SyncEngine | null): Hono<We
             })
         }
 
-        const result = await runRpc(() => engine.readGeneratedImage(sessionResult.sessionId, parsed.data.imageId))
+        const local = await historicalGeneratedImage(engine, sessionResult.session, parsed.data.imageId)
+        const result = local ?? await runRpc(() => engine.readGeneratedImage(sessionResult.sessionId, parsed.data.imageId))
         if (!result.success || !result.content) {
             return c.json({ success: false, error: result.error ?? 'Generated image not found' }, 404)
         }

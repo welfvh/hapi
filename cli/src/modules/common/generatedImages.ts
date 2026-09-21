@@ -1,4 +1,6 @@
-import { basename } from 'node:path'
+import { basename, join } from 'node:path'
+import { mkdirSync, writeFileSync, renameSync, readFileSync, statSync } from 'node:fs'
+import { resolveHapiHomeDir } from '@/configuration'
 import { fileURLToPath } from 'node:url'
 import { open } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
@@ -319,6 +321,18 @@ export function registerGeneratedImage(args: { id: string; path: string; mimeTyp
         mimeType: args.mimeType,
         createdAt: Date.now()
     }
+    // The transcript references this ID permanently; process-local eviction must
+    // never discard its only bytes. Metadata is published after the original.
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(args.id)) throw new Error('Invalid generated media ID')
+    const directory = join(resolveHapiHomeDir(), 'generated-media')
+    mkdirSync(directory, { recursive: true, mode: 0o700 })
+    const stem = join(directory, args.id)
+    const part = `${stem}.${randomUUID()}.part`
+    writeFileSync(part, content, { mode: 0o600, flag: 'wx' })
+    renameSync(part, `${stem}.bin`)
+    writeFileSync(`${part}.json`, JSON.stringify({ id: metadata.id, fileName: metadata.fileName,
+        mimeType: metadata.mimeType, createdAt: metadata.createdAt }), { mode: 0o600, flag: 'wx' })
+    renameSync(`${part}.json`, `${stem}.json`)
     generatedImages.set(args.id, metadata)
     generatedImageBytes += content.byteLength
 
@@ -340,7 +354,18 @@ function evictOldGeneratedImages(): void {
 }
 
 export function getGeneratedImage(id: string): GeneratedImageMetadata | null {
-    return generatedImages.get(id) ?? null
+    const cached = generatedImages.get(id)
+    if (cached) return cached
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) return null
+    try {
+        const stem = join(resolveHapiHomeDir(), 'generated-media', id)
+        if (statSync(`${stem}.json`).size > 64 * 1024 || statSync(`${stem}.bin`).size > MAX_GENERATED_IMAGE_BYTES) return null
+        const metadata = JSON.parse(readFileSync(`${stem}.json`, 'utf8')) as Record<string, unknown>
+        if (metadata.id !== id || typeof metadata.fileName !== 'string' || typeof metadata.mimeType !== 'string') return null
+        return { id, fileName: metadata.fileName, mimeType: metadata.mimeType,
+            createdAt: typeof metadata.createdAt === 'number' ? metadata.createdAt : 0,
+            content: readFileSync(`${stem}.bin`) }
+    } catch { return null }
 }
 
 export function clearGeneratedImages(): void {
