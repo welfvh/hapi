@@ -15,6 +15,7 @@ type DbMessageRow = {
     seq: number
     local_id: string | null
     invoked_at: number | null
+    queue_order?: number | null
     scheduled_at: number | null
     delivery_state: string | null
 }
@@ -90,6 +91,7 @@ function toStoredMessage(row: DbMessageRow): StoredMessage {
         localId: row.local_id,
         invokedAt: row.invoked_at ?? null,
         scheduledAt: row.scheduled_at ?? null,
+        queueOrder: row.queue_order ?? row.seq,
         ...(row.delivery_state && row.delivery_state !== 'queued' ? { deliveryState: 'indeterminate' as const } : {})
     }
 }
@@ -489,7 +491,7 @@ export function getUninvokedLocalMessages(
 ): StoredMessage[] {
     const deliverableClause = options?.deliverableOnly ? " AND delivery_state = 'queued'" : ''
     const rows = db.prepare(
-        `SELECT * FROM messages WHERE session_id = ? AND invoked_at IS NULL AND local_id IS NOT NULL${deliverableClause} ORDER BY seq ASC`
+        `SELECT * FROM messages WHERE session_id = ? AND invoked_at IS NULL AND local_id IS NOT NULL${deliverableClause} ORDER BY COALESCE(queue_order, seq), seq`
     ).all(sessionId) as DbMessageRow[]
     return rows.map(toStoredMessage)
 }
@@ -565,7 +567,7 @@ export function getImmediateQueuedLocalMessages(
           AND local_id IS NOT NULL
           AND scheduled_at IS NULL
           AND delivery_state = 'queued'
-        ORDER BY seq ASC
+        ORDER BY COALESCE(queue_order, seq), seq
     `).all(sessionId) as DbMessageRow[]
     return rows.map(toStoredMessage)
 }
@@ -912,7 +914,7 @@ export function markUninvokedImmediateMessages(
           AND scheduled_at IS NULL
           AND invoked_at IS NULL
           AND delivery_state = 'queued'
-        ORDER BY seq ASC
+        ORDER BY COALESCE(queue_order, seq), seq
     `).all(sessionId) as Array<{ local_id: string }>
     if (rows.length === 0) return []
 

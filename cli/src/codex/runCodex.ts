@@ -305,6 +305,11 @@ export async function runCodex(opts: {
         });
     });
 
+    session.onReorderQueuedMessage({
+        prepare: (id, leftId, rightId) => messageQueue.prepareReorder(id, leftId, rightId),
+        settle: (id, committed) => messageQueue.settleReorder(id, committed),
+    });
+
     session.onCancelQueuedMessage((localId) => {
         const removed = messageQueue.cancelByLocalId(localId);
         logger.debug(`[codex] cancelByLocalId(${localId}): ${removed ? 'removed' : 'not found (best-effort)'}`);

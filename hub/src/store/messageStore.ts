@@ -1,3 +1,4 @@
+import { beginQueueMove, getQueueMove, settleQueueMove } from './queueOrder'
 import type { Database } from 'bun:sqlite'
 
 import type { StoredMessage } from './types'
@@ -49,6 +50,14 @@ export class MessageStore {
 
     constructor(db: Database) {
         this.db = db
+    }
+
+    beginQueueMove(sessionId: string, id: string, leftId: string, rightId: string) {
+        return beginQueueMove(this.db, sessionId, id, leftId, rightId)
+    }
+    getQueueMove(sessionId: string, id: string) { return getQueueMove(this.db, sessionId, id) }
+    settleQueueMove(sessionId: string, id: string, action: 'commit' | 'abort' | 'applied') {
+        return settleQueueMove(this.db, sessionId, id, action)
     }
 
     addMessage(sessionId: string, content: unknown, localId?: string, scheduledAt?: number | null, createdAt?: number): StoredMessage {

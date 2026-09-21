@@ -295,6 +295,7 @@ export type AttachmentMetadata = z.infer<typeof AttachmentMetadataSchema>
 export const DecryptedMessageSchema = z.object({
     id: z.string(),
     seq: z.number().nullable(),
+    queueOrder: z.number().optional(),
     localId: z.string().nullable(),
     content: z.unknown(),
     createdAt: z.number(),

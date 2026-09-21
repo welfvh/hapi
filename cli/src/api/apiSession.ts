@@ -242,6 +242,11 @@ export class ApiSessionClient extends EventEmitter {
     private pendingHubPromptEchoes: { text: string; localIds: string[] }[] = []
     private pendingMessageCallback: ((message: UserMessage, localId?: string) => void) | null = null
     private cancelQueuedMessageCallback: ((localId: string) => boolean | 'in-flight' | 'indeterminate' | 'consumed') | null = null
+    private reorderQueuedMessageCallbacks: {
+        prepare: (id: string, leftId: string, rightId: string) => boolean;
+        settle: (id: string, committed: boolean) => boolean;
+    } | null = null
+    private readonly reconcilingQueueMoves = new Set<string>()
     private retryQueuedMessageCallback: ((localId: string) => boolean) | null = null
     private readonly incomingFilter = new IncomingMessageFilter()
     private backfillInFlight: Promise<void> | null = null
@@ -450,6 +455,14 @@ export class ApiSessionClient extends EventEmitter {
                         this.handleIncomingMessage(data.body.message, true)
                     }
                     ack?.({ removed: false, accepted })
+                    return
+                }
+
+                if (data.body.t === 'reorder-queued-message') {
+                    const { operationId, leftId, rightId } = data.body
+                    const accepted = this.reorderQueuedMessageCallbacks?.prepare(operationId, leftId, rightId) === true
+                    ack?.({ removed: false, accepted })
+                    if (accepted) void this.reconcileQueueMove(operationId)
                     return
                 }
 
@@ -698,6 +711,34 @@ export class ApiSessionClient extends EventEmitter {
 
     onCancelQueuedMessage(callback: (localId: string) => boolean | 'in-flight' | 'indeterminate' | 'consumed'): void {
         this.cancelQueuedMessageCallback = callback
+    }
+
+    onReorderQueuedMessage(callbacks: {
+        prepare: (id: string, leftId: string, rightId: string) => boolean;
+        settle: (id: string, committed: boolean) => boolean;
+    }): void { this.reorderQueuedMessageCallbacks = callbacks }
+
+    private async reconcileQueueMove(id: string): Promise<void> {
+        if (this.reconcilingQueueMoves.has(id)) return
+        this.reconcilingQueueMoves.add(id)
+        const url = `${configuration.apiUrl}/cli/sessions/${encodeURIComponent(this.sessionId)}/queue-moves/${encodeURIComponent(id)}`
+        const options = { headers: buildHubRequestHeaders({ Authorization: `Bearer ${this.token}` }), timeout: 10_000 }
+        try {
+            // No timeout is treated as an abort: the durable decision may already
+            // be committed. Keep the reserved inputs held until reconciliation.
+            while (this.reorderQueuedMessageCallbacks) {
+                try {
+                    const response = await axios.get<{ state: string }>(url, options)
+                    const state = response.data.state
+                    if (state === 'aborted' || state === 'committed' || state === 'applied') {
+                        if (!this.reorderQueuedMessageCallbacks.settle(id, state !== 'aborted')) return
+                        if (state !== 'aborted') await axios.post(url, {}, options)
+                        return
+                    }
+                } catch { /* Disconnection preserves the reservation, then retries. */ }
+                await new Promise(resolve => setTimeout(resolve, 1_000))
+            }
+        } finally { this.reconcilingQueueMoves.delete(id) }
     }
 
     onRetryQueuedMessage(callback: (localId: string) => boolean): void {
@@ -1511,6 +1552,7 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     close(): void {
+        this.reorderQueuedMessageCallbacks = null
         if (this.state === 'closed') {
             return
         }

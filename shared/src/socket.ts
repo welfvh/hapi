@@ -153,6 +153,14 @@ export const UpdateRetryQueuedMessageBodySchema = z.object({
 
 export type UpdateRetryQueuedMessageBody = z.infer<typeof UpdateRetryQueuedMessageBodySchema>
 
+export const UpdateReorderQueuedMessageBodySchema = z.object({
+    t: z.literal('reorder-queued-message'),
+    sid: z.string(),
+    operationId: z.string(),
+    leftId: z.string(),
+    rightId: z.string()
+})
+
 export const UpdateCancelQueuedMessageBodySchema = z.object({
     t: z.literal('cancel-queued-message'),
     sid: z.string(),
@@ -175,7 +183,7 @@ export type CancelQueuedMessageAck = z.infer<typeof CancelQueuedMessageAckSchema
 export const UpdateSchema = z.object({
     id: z.string(),
     seq: z.number(),
-    body: z.union([UpdateNewMessageBodySchema, UpdateRetryQueuedMessageBodySchema, UpdateSessionBodySchema, UpdateMachineBodySchema, UpdateCancelQueuedMessageBodySchema]),
+    body: z.union([UpdateNewMessageBodySchema, UpdateRetryQueuedMessageBodySchema, UpdateSessionBodySchema, UpdateMachineBodySchema, UpdateCancelQueuedMessageBodySchema, UpdateReorderQueuedMessageBodySchema]),
     createdAt: z.number()
 })
 

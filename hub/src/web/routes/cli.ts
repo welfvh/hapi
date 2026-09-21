@@ -255,6 +255,23 @@ export function createCliRoutes(getSyncEngine: () => SyncEngine | null): Hono<Cl
         return c.json({ session: resolved.session, sessionSummaryContract })
     })
 
+    app.get('/sessions/:id/queue-moves/:operationId', (c) => {
+        const engine = getSyncEngine()
+        if (!engine) return c.json({ error: 'Not ready' }, 503)
+        const resolved = resolveSessionForNamespace(engine, c.req.param('id'), c.get('namespace'))
+        if (!resolved.ok) return c.json({ error: resolved.error }, resolved.status)
+        const move = engine.getQueueMove(resolved.sessionId, c.req.param('operationId'))
+        return move ? c.json({ state: move.state }) : c.json({ error: 'Queue move not found' }, 404)
+    })
+    app.post('/sessions/:id/queue-moves/:operationId', (c) => {
+        const engine = getSyncEngine()
+        if (!engine) return c.json({ error: 'Not ready' }, 503)
+        const resolved = resolveSessionForNamespace(engine, c.req.param('id'), c.get('namespace'))
+        if (!resolved.ok) return c.json({ error: resolved.error }, resolved.status)
+        const move = engine.acknowledgeQueueMove(resolved.sessionId, c.req.param('operationId'))
+        return move ? c.json({ state: move.state }) : c.json({ error: 'Queue move not found' }, 404)
+    })
+
     app.get('/sessions/:id/messages', (c) => {
         const engine = getSyncEngine()
         if (!engine) {

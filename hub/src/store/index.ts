@@ -1,3 +1,4 @@
+import { createQueueOrderSchema } from './queueOrder'
 import { Database } from 'bun:sqlite'
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from 'node:fs'
 import { dirname } from 'node:path'
@@ -46,7 +47,7 @@ export {
     WorkGraphValidationError
 } from './workGraph'
 
-const SCHEMA_VERSION: number = 27
+const SCHEMA_VERSION: number = 28
 const REQUIRED_TABLES = [
     'sessions',
     'machines',
@@ -411,6 +412,7 @@ export class Store {
             23: () => this.migrateFromV23ToV24(),
             24: () => this.migrateFromV24ToV25(),
             25: () => this.migrateFromV25ToV26(),
+            27: () => createQueueOrderSchema(this.db),
             26: () => {
                 if (legacy) this.createSchema()
                 createOriginReceiptSchema(this.db)
@@ -439,6 +441,7 @@ export class Store {
 
             this.createSchema()
             createOriginReceiptSchema(this.db)
+            createQueueOrderSchema(this.db)
             this.setUserVersion(SCHEMA_VERSION)
             return
         }

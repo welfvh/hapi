@@ -48,6 +48,7 @@ export type StoredMessage = {
     seq: number
     localId: string | null
     invokedAt: number | null
+    queueOrder?: number
     scheduledAt: number | null
     /** Omitted for ordinary queued/delivered rows; set when steer outcome is unknown. */
     deliveryState?: MessageDeliveryState

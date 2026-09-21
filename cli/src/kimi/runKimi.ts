@@ -106,6 +106,11 @@ export async function runKimi(opts: {
         messageQueue.push(formattedText, mode, localId);
     });
 
+    session.onReorderQueuedMessage({
+        prepare: (id, leftId, rightId) => messageQueue.prepareReorder(id, leftId, rightId),
+        settle: (id, committed) => messageQueue.settleReorder(id, committed),
+    });
+
     session.onCancelQueuedMessage((localId) => {
         const removed = messageQueue.cancelByLocalId(localId);
         logger.debug(`[kimi] cancelByLocalId(${localId}): ${removed ? 'removed' : 'not found (best-effort)'}`);

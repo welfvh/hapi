@@ -485,6 +485,11 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
         }
     });
 
+    session.onReorderQueuedMessage({
+        prepare: (id, leftId, rightId) => messageQueue.prepareReorder(id, leftId, rightId),
+        settle: (id, committed) => messageQueue.settleReorder(id, committed),
+    });
+
     session.onCancelQueuedMessage((localId) => {
         const deferredIndex = deferredMessages.findIndex(([, id]) => id === localId);
         if (deferredIndex >= 0) {

@@ -107,6 +107,11 @@ export async function runCursor(opts: {
         enqueueCursorUserMessage(messageQueue, formattedText, enhancedMode, localId);
     });
 
+    session.onReorderQueuedMessage({
+        prepare: (id, leftId, rightId) => messageQueue.prepareReorder(id, leftId, rightId),
+        settle: (id, committed) => messageQueue.settleReorder(id, committed),
+    });
+
     session.onCancelQueuedMessage((localId) => {
         const removed = messageQueue.cancelByLocalId(localId);
         logger.debug(`[cursor] cancelByLocalId(${localId}): ${removed ? 'removed' : 'not found (best-effort)'}`);

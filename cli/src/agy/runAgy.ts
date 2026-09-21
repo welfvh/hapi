@@ -108,6 +108,11 @@ export async function runAgy(opts: {
             messageQueue.push(formattedText, mode, localId);
         });
 
+        session.onReorderQueuedMessage({
+            prepare: (id, leftId, rightId) => messageQueue.prepareReorder(id, leftId, rightId),
+            settle: (id, committed) => messageQueue.settleReorder(id, committed),
+        });
+
         session.onCancelQueuedMessage((localId) => {
             // A batch held in the driver's retry backoff is outside MessageQueue2;
             // the driver-owned cancel handles it (returns true when removed).

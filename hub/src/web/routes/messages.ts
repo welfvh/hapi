@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { z } from 'zod'
 import { MessagesQuerySchema, QueuedStateRequestSchema, SendMessageRequestSchema } from '@hapi/protocol'
 import type { SyncEngine } from '../../sync/syncEngine'
 import type { WebAppEnv } from '../middleware/auth'
@@ -57,6 +58,26 @@ export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null): Ho
             until,
             epoch: parsed.data.epoch ?? null
         }))
+    })
+
+    app.post('/sessions/:id/messages/reorder', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+        const session = requireSessionFromParam(c, engine)
+        if (session instanceof Response) return session
+        const parsed = z.object({ operationId: z.string().uuid(), leftId: z.string().min(1), rightId: z.string().min(1) })
+            .safeParse(await c.req.json().catch(() => null))
+        if (!parsed.success) return c.json({ error: 'Invalid queue move' }, 400)
+        return c.json(await engine.reorderQueuedMessages(session.sessionId, parsed.data.operationId, parsed.data.leftId, parsed.data.rightId))
+    })
+
+    app.get('/sessions/:id/messages/reorder/:operationId', (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+        const session = requireSessionFromParam(c, engine)
+        if (session instanceof Response) return session
+        const move = engine.getQueueMove(session.sessionId, c.req.param('operationId'))
+        return move ? c.json({ state: move.state }) : c.json({ error: 'Queue move not found' }, 404)
     })
 
     app.delete('/sessions/:id/messages/:messageId', async (c) => {

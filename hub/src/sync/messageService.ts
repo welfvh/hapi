@@ -38,6 +38,7 @@ function toDecryptedMessage(message: StoredMessageForDelivery): DecryptedMessage
     return {
         id: message.id,
         seq: message.seq,
+        queueOrder: message.queueOrder,
         localId: message.localId,
         content: message.content,
         createdAt: message.createdAt,
@@ -434,8 +435,70 @@ export class MessageService {
             createdAt: message.createdAt,
             invokedAt: message.invokedAt,
             scheduledAt: message.scheduledAt,
+            queueOrder: message.queueOrder,
             ...(message.deliveryState ? { deliveryState: message.deliveryState } : {})
         }))
+    }
+
+    getQueueMove(sessionId: string, id: string) { return this.store.messages.getQueueMove(sessionId, id) }
+
+    acknowledgeQueueMove(sessionId: string, id: string) {
+        const move = this.store.messages.settleQueueMove(sessionId, id, 'applied')
+        if (move?.state === 'applied') this.publishQueueOrder(sessionId)
+        return move
+    }
+
+    private publishQueueOrder(sessionId: string) {
+        for (const message of this.store.messages.getUninvokedLocalMessages(sessionId)) {
+            this.publisher.emit({ type: 'message-received', sessionId, message: toDecryptedMessage(message) })
+        }
+    }
+
+    async reorderQueuedMessages(sessionId: string, id: string, leftId: string, rightId: string) {
+        const move = this.store.messages.beginQueueMove(sessionId, id, leftId, rightId)
+        if (!move) return { status: 'conflict' as const }
+        if (move.state === 'applied') return { status: 'reordered' as const }
+        if (move.state === 'committed') return { status: 'pending' as const }
+        if (move.state === 'aborted') return { status: 'conflict' as const }
+        const namespace = this.io.of('/cli')
+        const adapter = namespace.adapter
+        const roomName = `session:${sessionId}`
+        const owners = adapter.rooms.get(roomName)
+        const ownerId = owners?.size === 1 ? owners.values().next().value : undefined
+        if (!ownerId) {
+            this.store.messages.settleQueueMove(sessionId, id, 'abort')
+            return { status: 'unavailable' as const }
+        }
+        let changed = false
+        const membershipChanged = (room: string) => { if (room === roomName) changed = true }
+        adapter.on('join-room', membershipChanged)
+        adapter.on('leave-room', membershipChanged)
+        try {
+            const accepted = await new Promise<boolean>(resolve => {
+                try {
+                    namespace.to(ownerId).timeout(2_000).emit('update', {
+                        id: randomUUID(), seq: 0, createdAt: Date.now(),
+                        body: { t: 'reorder-queued-message', sid: sessionId, operationId: id, leftId, rightId }
+                    }, (error: Error | null, responses: Array<{ accepted?: boolean }>) => {
+                        resolve(!error && responses?.length === 1 && responses[0]?.accepted === true)
+                    })
+                } catch { resolve(false) }
+            })
+            const currentOwners = adapter.rooms.get(roomName)
+            if (!accepted || changed || currentOwners?.size !== 1 || !currentOwners.has(ownerId)) {
+                this.store.messages.settleQueueMove(sessionId, id, 'abort')
+                return { status: 'unavailable' as const }
+            }
+            // The wrapper holds consumption while it polls this durable decision.
+            // A dropped HTTP or socket response never means release or replay.
+            const committed = this.store.messages.settleQueueMove(sessionId, id, 'commit')
+            if (committed?.state !== 'committed') return { status: 'conflict' as const }
+            this.publishQueueOrder(sessionId)
+            return { status: 'pending' as const }
+        } finally {
+            adapter.off('join-room', membershipChanged)
+            adapter.off('leave-room', membershipChanged)
+        }
     }
 
     async cancelQueuedMessage(

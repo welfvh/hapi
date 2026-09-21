@@ -37,6 +37,58 @@ export class MessageQueue2<T> {
     private nextEnqueueOrder = 0;
     private previousEnqueueOrder = -1;
 
+    private reorderHold: { id: string; left: QueueItem<T>; right: QueueItem<T>; done: Promise<void>; release: () => void; after: Array<() => void> } | null = null;
+    private readonly completedReorders = new Set<string>();
+
+    /** Reserve the live queue, without removing or invoking either input. */
+    prepareReorder(id: string, leftId: string, rightId: string): boolean {
+        if (this.completedReorders.has(id)) return true;
+        if (this.reorderHold) return this.reorderHold.id === id;
+        if (this.closed || this.reservations.size > 0) return false;
+        const index = this.queue.findIndex(item => item.localId === leftId);
+        if (index < 0 || this.queue[index + 1]?.localId !== rightId) return false;
+        let release!: () => void;
+        const done = new Promise<void>(resolve => { release = resolve; });
+        this.reorderHold = { id, left: this.queue[index], right: this.queue[index + 1], done, release, after: [] };
+        return true;
+    }
+
+    /** Called only after reading the hub's durable terminal decision. */
+    settleReorder(id: string, committed: boolean): boolean {
+        if (this.completedReorders.has(id)) return true;
+        const hold = this.reorderHold;
+        if (!hold || hold.id !== id) return false;
+        const index = this.queue.indexOf(hold.left);
+        if (committed && (index < 0 || this.queue[index + 1] !== hold.right)) return false;
+        if (committed) {
+            this.queue[index] = hold.right;
+            this.queue[index + 1] = hold.left;
+            const previousOrder = hold.left.enqueueOrder;
+            hold.left.enqueueOrder = hold.right.enqueueOrder;
+            hold.right.enqueueOrder = previousOrder;
+        }
+        this.reorderHold = null;
+        this.completedReorders.add(id);
+        if (this.completedReorders.size > 256) this.completedReorders.delete(this.completedReorders.values().next().value!);
+        for (const action of hold.after) action();
+        hold.release();
+        return true;
+    }
+
+    private async awaitReorder(abortSignal?: AbortSignal): Promise<boolean> {
+        while (this.reorderHold && !this.closed && !abortSignal?.aborted) {
+            const pending = this.reorderHold.done;
+            if (!abortSignal) await pending;
+            else await new Promise<void>(resolve => {
+                const finish = () => { abortSignal.removeEventListener('abort', finish); resolve(); };
+                abortSignal.addEventListener('abort', finish, { once: true });
+                void pending.then(finish);
+                if (abortSignal.aborted) finish();
+            });
+        }
+        return !this.closed && !abortSignal?.aborted;
+    }
+
     constructor(
         modeHasher: (mode: T) => string,
         onMessageHandler: ((message: string, mode: T) => void) | null = null
@@ -176,6 +228,13 @@ export class MessageQueue2<T> {
      * Used for special commands that require dedicated processing.
      */
     pushIsolateAndClear(message: string, mode: T, localId?: string): void {
+        if (this.reorderHold) {
+            // Preserve both reserved inputs; the explicit clear runs once the
+            // order decision is durable, before the next queued batch.
+            const hold = this.reorderHold;
+            hold.after.push(() => { if (!this.closed) this.pushIsolateAndClear(message, mode, localId); });
+            return;
+        }
         if (this.closed) {
             throw new Error('Cannot push to closed queue');
         }
@@ -300,6 +359,7 @@ export class MessageQueue2<T> {
      * may already have been collected for invocation and won't be found here.
      */
     cancelByLocalId(localId: string): boolean | 'in-flight' | 'indeterminate' | 'consumed' {
+        if (this.reorderHold) return 'in-flight';
         if (!localId) return false;
         const idx = this.queue.findIndex(item => item.localId === localId);
         if (idx !== -1) {
@@ -333,6 +393,7 @@ export class MessageQueue2<T> {
      * Look up a queued item by localId without removing it.
      */
     peekByLocalId(localId: string): QueueItem<T> | null {
+        if (this.reorderHold) return null;
         if (!localId) return null;
         return this.queue.find(item => item.localId === localId) ?? null;
     }
@@ -497,6 +558,7 @@ export class MessageQueue2<T> {
      * Reset the queue - clears all messages and resets to empty state
      */
     reset(options?: { preserveDispatchingReservations?: boolean }): void {
+        if (this.reorderHold) throw new Error('Queue order is awaiting reconciliation; reset is unavailable');
         logger.debug(`[MessageQueue2] reset() called. Clearing ${this.queue.length} messages`);
         this.queue = [];
         this.cancelReservations(options?.preserveDispatchingReservations === true);
@@ -523,6 +585,7 @@ export class MessageQueue2<T> {
     close(): void {
         logger.debug(`[MessageQueue2] close() called`);
         this.closed = true;
+        this.reorderHold?.release();
         this.cancelReservations();
 
         // Notify any waiting caller
@@ -552,6 +615,7 @@ export class MessageQueue2<T> {
      * Returns { message: string, mode: T } or null if aborted/closed
      */
     async waitForMessagesAndGetAsString(abortSignal?: AbortSignal): Promise<{ message: string, mode: T, isolate: boolean, hash: string, items: Array<{ message: string, localId?: string }> } | null> {
+        if (this.reorderHold && !await this.awaitReorder(abortSignal)) return null;
         // If we have messages, return them immediately
         if (this.queue.length > 0) {
             return this.collectBatch();
@@ -569,6 +633,7 @@ export class MessageQueue2<T> {
             return null;
         }
 
+        if (this.reorderHold && !await this.awaitReorder(abortSignal)) return null;
         return this.collectBatch();
     }
 
@@ -576,7 +641,7 @@ export class MessageQueue2<T> {
      * Collect a batch of messages with the same mode, respecting isolation requirements
      */
     private collectBatch(): { message: string, mode: T, hash: string, isolate: boolean, items: Array<{ message: string, localId?: string }> } | null {
-        if (this.queue.length === 0) {
+        if (this.reorderHold || this.queue.length === 0) {
             return null;
         }
 

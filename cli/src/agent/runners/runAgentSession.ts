@@ -56,6 +56,11 @@ export async function runAgentSession(opts: {
         messageQueue.push(formattedText, {}, localId);
     });
 
+    session.onReorderQueuedMessage({
+        prepare: (id, leftId, rightId) => messageQueue.prepareReorder(id, leftId, rightId),
+        settle: (id, committed) => messageQueue.settleReorder(id, committed),
+    });
+
     session.onCancelQueuedMessage((localId) => {
         const removed = messageQueue.cancelByLocalId(localId);
         logger.debug(`[agent] cancelByLocalId(${localId}): ${removed ? 'removed' : 'not found (best-effort)'}`);

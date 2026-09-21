@@ -1044,6 +1044,12 @@ export class SyncEngine {
         return result.receipt
     }
 
+    getQueueMove(sessionId: string, id: string) { return this.messageService.getQueueMove(sessionId, id) }
+    acknowledgeQueueMove(sessionId: string, id: string) { return this.messageService.acknowledgeQueueMove(sessionId, id) }
+    reorderQueuedMessages(sessionId: string, id: string, leftId: string, rightId: string) {
+        return this.messageService.reorderQueuedMessages(sessionId, id, leftId, rightId)
+    }
+
     async cancelQueuedMessage(
         sessionId: string,
         messageId: string

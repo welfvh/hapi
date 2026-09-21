@@ -243,6 +243,11 @@ export async function runCopilot(opts: {
         });
     });
 
+    session.onReorderQueuedMessage({
+        prepare: (id, leftId, rightId) => messageQueue.prepareReorder(id, leftId, rightId),
+        settle: (id, committed) => messageQueue.settleReorder(id, committed),
+    });
+
     session.onCancelQueuedMessage((localId) => {
         const removedFromQueue = messageQueue.cancelByLocalId(localId);
         if (!removedFromQueue && preparingLocalIds.has(localId)) {
