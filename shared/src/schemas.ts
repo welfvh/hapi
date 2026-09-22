@@ -101,6 +101,14 @@ export const MetadataSchema = z.object({
         machineId: z.string(),
         startedAt: z.number(),
     }).optional(),
+    // Durable guard for Codex/Claude reactivation. While present, duplicate
+    // native-agent rows must never replace the original HAPI identity.
+    stableIdentityResumeAttempt: z.object({
+        state: z.enum(['resuming', 'quarantined']),
+        machineId: z.string(),
+        startedAt: z.number(),
+        childSessionId: z.string().optional(),
+    }).optional(),
     tools: z.array(z.string()).optional(),
     slashCommands: z.array(z.string()).optional(),
     homeDir: z.string().optional(),

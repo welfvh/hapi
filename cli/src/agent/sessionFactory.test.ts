@@ -160,6 +160,11 @@ describe('bootstrapExistingSession', () => {
                 machineId: 'machine-1',
                 startedAt: 456,
             },
+            stableIdentityResumeAttempt: {
+                state: 'resuming',
+                machineId: 'machine-1',
+                startedAt: 789,
+            },
             summary: {
                 text: 'resume me',
                 updatedAt: 100
@@ -205,6 +210,11 @@ describe('bootstrapExistingSession', () => {
                 state: 'quarantined',
                 machineId: 'machine-1',
                 startedAt: 456,
+            },
+            stableIdentityResumeAttempt: {
+                state: 'resuming',
+                machineId: 'machine-1',
+                startedAt: 789,
             },
             summary: {
                 text: 'resume me',

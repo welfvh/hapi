@@ -281,15 +281,16 @@ describe('buildCliArgs', () => {
         expect(args).toContain('hapi-session-pi-1')
     })
 
-    it('still passes --resume for claude when resumeSessionId is provided', () => {
-        // Guard against accidentally swallowing claude's --resume when
-        // the pi branch was added.
+    it('passes the original HAPI row separately from the Claude resume id', () => {
         const args = buildCliArgs('claude', {
             directory: '/tmp',
             resumeSessionId: 'some-claude-session-id',
+            existingSessionId: 'hapi-session-claude-1',
         })
         expect(args).toContain('--resume')
         expect(args).toContain('some-claude-session-id')
+        expect(args).toContain('--existing-session-id')
+        expect(args).toContain('hapi-session-claude-1')
     })
 
     it('passes --fork-session and --existing-session-id for Claude message-level fork', () => {
